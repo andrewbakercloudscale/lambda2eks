@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sample app used by the lambda2eks tests and README.
+
+Globals:
+  Function:
+    Timeout: 10
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  OrdersApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: orders-api
+      Runtime: python3.12
+      Handler: app.handler
+      CodeUri: orders_api/
+      MemorySize: 512
+      Role: arn:aws:iam::123456789012:role/orders-api-role
+      Environment:
+        Variables:
+          TABLE_NAME: orders
+          STRIPE_API_KEY: sk_test_do_not_ship
+      Events:
+        GetOrder:
+          Type: HttpApi
+          Properties:
+            Path: /orders/{id}
+            Method: GET
+        ListOrders:
+          Type: HttpApi
+          Properties:
+            Path: /orders
+            Method: GET
+
+  OrderWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: order-worker
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: order_worker/
+      MemorySize: 1024
+      Timeout: 60
+      ReservedConcurrentExecutions: 5
+      Architectures: [arm64]
+      Role: arn:aws:iam::123456789012:role/order-worker-role
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: arn:aws:sqs:eu-west-1:123456789012:orders
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+        Uploads:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+
+  NightlyReport:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: nightly-report
+      Runtime: python3.12
+      Handler: report.lambda_handler
+      CodeUri: nightly_report/
+      Role: !GetAtt ReportRole.Arn
+      Events:
+        Nightly:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 2 ? * MON-FRI *)
+            Input: '{"report": "daily"}'
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
