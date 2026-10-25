@@ -147,6 +147,8 @@ def test_invoke_api(lang, tmp_path):
         status, headers, body = call(base, path, "POST", json.dumps({"a": 1}).encode())
         assert status == 200 and json.loads(body) == {"echo": {"a": 1}, "fn": "orders-api"}
         assert "X-Amz-Function-Error" not in headers
+        status, _, body = call(base, path.replace("/function/", "/orders-api/"), "POST", b"{}")
+        assert status == 200 and json.loads(body)["echo"] == {}
         status, headers, body = call(base, path, "POST", json.dumps({"boom": True}).encode())
         assert status == 200 and headers["X-Amz-Function-Error"] == "Unhandled"
         assert json.loads(body)["errorMessage"] == "boom"
@@ -160,6 +162,7 @@ def test_python_sqs_partial_failures(tmp_path, monkeypatch):
     monkeypatch.setenv("LAMBDA_TASK_ROOT", str(tmp_path))
     sys.path.insert(0, str(SHIMS))
     import shim  # noqa: PLC0415
+    monkeypatch.setattr(shim, "TASK_ROOT", str(tmp_path))  # another test may have imported it already
 
     class FakeSQS:
         def __init__(self):

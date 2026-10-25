@@ -10,8 +10,15 @@ from typing import Any
 HTTP = "http"          # API Gateway REST/HTTP API or a function URL -> Deployment + Service + Ingress
 SQS = "sqs"            # SQS event source mapping -> worker Deployment + KEDA ScaledObject
 SCHEDULE = "schedule"  # EventBridge schedule -> CronJob
+S3 = "s3"              # S3 notifications -> bridge SQS queue -> worker that unwraps them
+SNS = "sns"            # SNS subscription -> bridge SQS queue -> worker that rebuilds the SNS event
+KINESIS = "kinesis"    # Kinesis event source mapping -> stream consumer + KEDA
+DYNAMODB = "dynamodb"  # DynamoDB stream event source mapping -> stream consumer + KEDA
 INVOKE = "invoke"      # no trigger found: called through the Invoke API -> Deployment + Service
 UNSUPPORTED = "unsupported"
+
+BRIDGED = (S3, SNS)
+STREAMS = (KINESIS, DYNAMODB)
 
 
 @dataclass
@@ -20,7 +27,12 @@ class Trigger:
     # http: method, path, event_format ("1.0" REST, "2.0" HTTP API / function URL)
     # sqs: queue_arn, queue_url, batch_size, report_batch_item_failures
     # schedule: expression, input (JSON string or None)
-    # unsupported: source (e.g. "s3", "dynamodb"), detail
+    # s3: bucket, events, filter_rules ([{"Name": "prefix", "Value": ...}])
+    # sns: topic_arn, filter_policy, filter_policy_scope
+    # kinesis/dynamodb: stream_arn, stream_name / table_name, starting_position, batch_size,
+    #   max_retry_attempts, bisect_on_error, report_batch_item_failures, parallelization_factor
+    # sqs/kinesis/dynamodb may carry esm_uuid (the event source mapping) and filter_criteria
+    # unsupported: source (e.g. "kafka", "eventbridge-rule"), detail
     details: dict[str, Any] = field(default_factory=dict)
 
 

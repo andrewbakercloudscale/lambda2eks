@@ -1,4 +1,4 @@
-from lambda2eks.model import HTTP, SCHEDULE, SQS, UNSUPPORTED
+from lambda2eks.model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SNS, SQS
 from lambda2eks.plan import baseline_plan, k8s_name
 
 
@@ -11,7 +11,8 @@ def test_loads_sample(sample_specs):
     assert api.account_id == "123456789012"
 
     kinds = [t.kind for t in worker.triggers]
-    assert kinds == [SQS, UNSUPPORTED]
+    assert kinds == [SQS, S3]
+    assert worker.triggers[1].details["bucket"] == "REPLACE_ME_BUCKET"  # generated bucket name
     sqs = worker.triggers[0].details
     assert sqs["queue_url"] == "https://sqs.eu-west-1.amazonaws.com/123456789012/orders"
     assert sqs["batch_size"] == 5 and sqs["report_batch_item_failures"] is True
@@ -33,7 +34,26 @@ def test_baseline_plan(sample_specs):
 
     worker = baseline_plan(sample_specs["order-worker"], "r")
     assert worker.sqs_max_replicas == 5
-    assert [t.details["source"] for t in worker.unsupported_triggers] == ["s3"]
+    assert worker.unsupported_triggers == []
+    assert [(w.kind, w.name, w.bridge_queue) for w in worker.workloads] == [
+        (SQS, "order-worker-sqs-orders", None),
+        (S3, "order-worker-s3-replace-me-bucket", "l2e-order-worker-s3-replace-me-bucket")]
+
+
+def test_loads_streams_and_sns(sample_specs):
+    ddb = sample_specs["stock-sync"].triggers[0]
+    assert ddb.kind == DYNAMODB and ddb.details["table_name"] == "stock" and ddb.details["stream_arn"] is None
+    assert ddb.details["batch_size"] == 50 and ddb.details["max_retry_attempts"] == 3
+    assert ddb.details["bisect_on_error"] and ddb.details["report_batch_item_failures"]
+    kin = sample_specs["click-ingest"]
+    assert kin.triggers[0].kind == KINESIS and kin.triggers[0].details["stream_name"] == "clicks"
+    assert kin.region == "eu-west-1" and kin.account_id == "123456789012"
+    sns = sample_specs["alert-notifier"].triggers[0]
+    assert sns.kind == SNS and sns.details["topic_arn"] == "arn:aws:sns:REPLACE_ME_REGION:REPLACE_ME_ACCOUNT:alerts"
+    assert sns.details["filter_policy"] == {"severity": ["high", "critical"]}
+    plan = baseline_plan(kin, "r")
+    assert [(w.kind, w.name) for w in plan.workloads] == [(KINESIS, "click-ingest-kinesis-clicks")]
+    assert plan.stream_max_replicas == 4
 
 
 def test_unsupported_runtime(sample_specs):

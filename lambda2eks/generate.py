@@ -11,12 +11,13 @@ from typing import Any
 
 import yaml
 
-from .model import HTTP, INVOKE, SCHEDULE, SQS
+from .model import BRIDGED, DYNAMODB, HTTP, INVOKE, KINESIS, S3, SCHEDULE, SNS, SQS, STREAMS
 from .plan import Plan, Workload
 from .schedule import ScheduleError, to_k8s_cron
 
 HEALTH_PATH = "/_lambda2eks/healthz"
 PORT = 8080
+PAUSED = "autoscaling.keda.sh/paused-replicas"
 
 
 class _Dumper(yaml.SafeDumper):
@@ -96,7 +97,7 @@ def write_build_context(plan: Plan, out: Path) -> None:
     shim = "shim.py" if spec.runtime_family == "python" else "shim.mjs"
     (out / f"lambda2eks-{shim}").write_text(resources.files("lambda2eks.shims").joinpath(shim).read_text())
     (out / "Dockerfile").write_text(dockerfile(plan, src_present))
-    (out / ".dockerignore").write_text("k8s/\niam/\nai/\nMIGRATION.md\nbuild.sh\n")
+    (out / ".dockerignore").write_text("k8s/\nhelm/\niam/\ninfra/\ncutover/\nai/\nMIGRATION.md\nbuild.sh\n")
     build = out / "build.sh"
     build.write_text(
         "#!/usr/bin/env bash\n"
@@ -177,7 +178,29 @@ def _pod_spec(plan: Plan, workload: Workload, mode_env: list[dict[str, str]], re
 
 
 def workload_mode(w: Workload) -> str:
-    return {HTTP: "http", INVOKE: "http", SQS: "sqs", SCHEDULE: "schedule"}[w.kind]
+    return {HTTP: "http", INVOKE: "http", SQS: "sqs", S3: "sqs", SNS: "sqs", SCHEDULE: "schedule",
+            KINESIS: "stream", DYNAMODB: "stream"}[w.kind]
+
+
+class Target:
+    """Where the workloads run: the resolved region and account, and generation options."""
+
+    def __init__(self, plan: Plan, namespace: str, region: str, iam_mode: str, live: bool = False,
+                 certificate_arn: str | None = None):
+        self.namespace, self.region, self.iam_mode, self.live, self.certificate_arn = namespace, region, iam_mode, live, certificate_arn
+        self.account = plan.spec.account_id or "REPLACE_ME_ACCOUNT"
+
+    def queue_url(self, name: str) -> str:
+        return f"https://sqs.{self.region}.amazonaws.com/{self.account}/{name}"
+
+    def queue_arn(self, name: str) -> str:
+        return f"arn:aws:sqs:{self.region}:{self.account}:{name}"
+
+    def lease_table(self, plan: Plan) -> str:
+        return f"l2e-{plan.k8s_name}-leases"
+
+    def lease_table_arn(self, plan: Plan) -> str:
+        return f"arn:aws:dynamodb:{self.region}:{self.account}:table/{self.lease_table(plan)}"
 
 
 def _deployment(plan: Plan, w: Workload, replicas: int, pod: dict[str, Any]) -> dict[str, Any]:
@@ -204,7 +227,7 @@ def _ingress_paths(routes: list[dict[str, Any]]) -> list[str]:
     return sorted(prefixes)
 
 
-def http_docs(plan: Plan, w: Workload, region: str) -> list[dict[str, Any]]:
+def http_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
     spec = plan.spec
     mode_env = [{"name": "L2E_PORT", "value": str(PORT)}]
     if w.kind == HTTP:
@@ -213,7 +236,7 @@ def http_docs(plan: Plan, w: Workload, region: str) -> list[dict[str, Any]]:
             {"name": "L2E_HTTP_ROUTES", "value": json.dumps([r for r in w.trigger.details["routes"] if r.get("path")])},
         ]
     grace = max(30, spec.timeout_s + 10)
-    docs = [_deployment(plan, w, plan.http_min_replicas, _pod_spec(plan, w, mode_env, region, http=True, grace=grace))]
+    docs = [_deployment(plan, w, plan.http_min_replicas, _pod_spec(plan, w, mode_env, t.region, http=True, grace=grace))]
     selector = {"app.kubernetes.io/name": plan.k8s_name, "app.kubernetes.io/component": w.name}
     docs.append({
         "apiVersion": "v1", "kind": "Service",
@@ -237,14 +260,21 @@ def http_docs(plan: Plan, w: Workload, region: str) -> list[dict[str, Any]]:
         })
     if w.kind == HTTP:
         idle = max(60, spec.timeout_s + 5)
+        annotations = {
+            "alb.ingress.kubernetes.io/scheme": plan.ingress_scheme,
+            "alb.ingress.kubernetes.io/target-type": "ip",
+            "alb.ingress.kubernetes.io/healthcheck-path": HEALTH_PATH,
+            "alb.ingress.kubernetes.io/load-balancer-attributes": f"idle_timeout.timeout_seconds={idle}",
+        }
+        if t.certificate_arn:
+            annotations.update({
+                "alb.ingress.kubernetes.io/listen-ports": '[{"HTTP": 80}, {"HTTPS": 443}]',
+                "alb.ingress.kubernetes.io/certificate-arn": t.certificate_arn,
+                "alb.ingress.kubernetes.io/ssl-redirect": "443",
+            })
         docs.append({
             "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
-            "metadata": {"name": w.name, "labels": _labels(plan, w.name), "annotations": {
-                "alb.ingress.kubernetes.io/scheme": plan.ingress_scheme,
-                "alb.ingress.kubernetes.io/target-type": "ip",
-                "alb.ingress.kubernetes.io/healthcheck-path": HEALTH_PATH,
-                "alb.ingress.kubernetes.io/load-balancer-attributes": f"idle_timeout.timeout_seconds={idle}",
-            }},
+            "metadata": {"name": w.name, "labels": _labels(plan, w.name), "annotations": annotations},
             "spec": {"ingressClassName": "alb", "rules": [{"http": {"paths": [
                 {"path": p, "pathType": "Prefix", "backend": {"service": {"name": w.name, "port": {"name": "http"}}}}
                 for p in _ingress_paths(w.trigger.details["routes"])
@@ -253,63 +283,113 @@ def http_docs(plan: Plan, w: Workload, region: str) -> list[dict[str, Any]]:
     return docs
 
 
-def sqs_docs(plan: Plan, w: Workload, region: str, iam_mode: str) -> list[dict[str, Any]]:
-    d = w.trigger.details
-    url = d.get("queue_url") or "REPLACE_ME"
-    mode_env = [
-        {"name": "L2E_SQS_QUEUE_URL", "value": url},
-        {"name": "L2E_SQS_QUEUE_ARN", "value": d.get("queue_arn") or ""},
-        {"name": "L2E_SQS_BATCH_SIZE", "value": str(d.get("batch_size", 10))},
-        {"name": "L2E_SQS_REPORT_BATCH_ITEM_FAILURES", "value": "true" if d.get("report_batch_item_failures") else "false"},
-    ]
-    grace = plan.spec.timeout_s + 30  # one long poll (20 s) plus the batch in flight
-    docs = [_deployment(plan, w, 1, _pod_spec(plan, w, mode_env, region, http=False, grace=grace))]
+def _keda_auth(plan: Plan, w: Workload, t: Target) -> dict[str, Any]:
     pod_identity: dict[str, Any] = {"provider": "aws"}
-    if iam_mode == "irsa":
+    if t.iam_mode == "irsa":
         pod_identity["identityOwner"] = "workload"
     else:
         pod_identity["roleArn"] = plan.spec.role_arn or "REPLACE_ME"
-    docs.append({
-        "apiVersion": "keda.sh/v1alpha1", "kind": "TriggerAuthentication",
-        "metadata": {"name": w.name, "labels": _labels(plan, w.name)},
-        "spec": {"podIdentity": pod_identity},
-    })
-    docs.append({
-        "apiVersion": "keda.sh/v1alpha1", "kind": "ScaledObject",
-        "metadata": {"name": w.name, "labels": _labels(plan, w.name)},
+    return {"apiVersion": "keda.sh/v1alpha1", "kind": "TriggerAuthentication",
+            "metadata": {"name": w.name, "labels": _labels(plan, w.name)}, "spec": {"podIdentity": pod_identity}}
+
+
+def _scaled_object(plan: Plan, w: Workload, t: Target, min_r: int, max_r: int, trigger: dict[str, Any]) -> dict[str, Any]:
+    meta: dict[str, Any] = {"name": w.name, "labels": _labels(plan, w.name)}
+    if not t.live:
+        # Nothing consumes until the cut-over; CUTOVER.md removes this annotation at the right moment.
+        meta["annotations"] = {PAUSED: "0"}
+    return {
+        "apiVersion": "keda.sh/v1alpha1", "kind": "ScaledObject", "metadata": meta,
         "spec": {
-            "scaleTargetRef": {"name": w.name},
-            "minReplicaCount": 0, "maxReplicaCount": plan.sqs_max_replicas,
+            "scaleTargetRef": {"name": w.name}, "minReplicaCount": min_r, "maxReplicaCount": max_r,
             "pollingInterval": 15, "cooldownPeriod": 300,
-            "triggers": [{"type": "aws-sqs-queue", "authenticationRef": {"name": w.name}, "metadata": {
-                "queueURL": url, "queueLength": str(max(1, min(int(d.get("batch_size", 10)), 10)) * plan.concurrency),
-                "awsRegion": region,
-            }}],
+            "triggers": [{**trigger, "authenticationRef": {"name": w.name}}],
         },
-    })
-    return docs
+    }
 
 
-def schedule_docs(plan: Plan, w: Workload, region: str) -> list[dict[str, Any]]:
+def sqs_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
+    d = w.trigger.details
+    if w.kind in BRIDGED:
+        url, arn, batch = t.queue_url(w.bridge_queue), t.queue_arn(w.bridge_queue), 10
+        mode_env = [{"name": "L2E_SQS_UNWRAP", "value": w.kind}]
+        if d.get("subscription_arn"):
+            mode_env.append({"name": "L2E_SNS_SUBSCRIPTION_ARN", "value": d["subscription_arn"]})
+    else:
+        url, arn, batch = d.get("queue_url") or "REPLACE_ME", d.get("queue_arn") or "", int(d.get("batch_size", 10))
+        mode_env = [{"name": "L2E_SQS_REPORT_BATCH_ITEM_FAILURES", "value": "true" if d.get("report_batch_item_failures") else "false"}]
+    mode_env = [{"name": "L2E_SQS_QUEUE_URL", "value": url}, {"name": "L2E_SQS_QUEUE_ARN", "value": arn},
+                {"name": "L2E_SQS_BATCH_SIZE", "value": str(batch)}] + mode_env
+    grace = plan.spec.timeout_s + 30  # one long poll (20 s) plus the batch in flight
+    per_pod = (1 if w.kind in BRIDGED else max(1, min(batch, 10))) * plan.concurrency
+    return [
+        _deployment(plan, w, 0 if not t.live else 1, _pod_spec(plan, w, mode_env, t.region, http=False, grace=grace)),
+        _keda_auth(plan, w, t),
+        _scaled_object(plan, w, t, 0, plan.sqs_max_replicas, {"type": "aws-sqs-queue", "metadata": {
+            "queueURL": url, "queueLength": str(per_pod), "awsRegion": t.region}}),
+    ]
+
+
+def stream_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
+    d = w.trigger.details
+    limit = 10000 if w.kind == KINESIS else 1000  # GetRecords maximums
+    mode_env = [
+        {"name": "L2E_STREAM_KIND", "value": w.kind},
+        # For a cut-over the start is a timestamp CUTOVER.md sets; the Lambda's starting position would
+        # replay the stream's whole retention (TRIM_HORIZON) or skip records written during the switch (LATEST).
+        {"name": "L2E_STREAM_STARTING_POSITION", "value": d.get("starting_position") or "LATEST" if t.live else "LATEST"},
+        {"name": "L2E_STREAM_BATCH_SIZE", "value": str(max(1, min(int(d.get("batch_size", 100)), limit)))},
+        {"name": "L2E_STREAM_MAX_RETRY", "value": str(d.get("max_retry_attempts", -1))},
+        {"name": "L2E_STREAM_BISECT", "value": "true" if d.get("bisect_on_error") else "false"},
+        {"name": "L2E_STREAM_REPORT_BATCH_ITEM_FAILURES", "value": "true" if d.get("report_batch_item_failures") else "false"},
+        *([{"name": "L2E_STREAM_START_TIMESTAMP", "value": str(d["starting_timestamp"])}]
+          if t.live and d.get("starting_position") == "AT_TIMESTAMP" and d.get("starting_timestamp") else []),
+        {"name": "L2E_LEASE_TABLE", "value": t.lease_table(plan)},
+        {"name": "L2E_CONSUMER_NAME", "value": w.name},
+        {"name": "L2E_ROLE_ARN", "value": plan.spec.role_arn or ""},
+    ]
+    if w.kind == KINESIS:
+        mode_env += [{"name": "L2E_STREAM_NAME", "value": d.get("stream_name") or "REPLACE_ME"},
+                     {"name": "L2E_STREAM_ARN", "value": d.get("stream_arn") or ""}]
+        scaler = {"type": "aws-kinesis-stream", "metadata": {
+            "streamName": d.get("stream_name") or "REPLACE_ME", "shardCount": "1", "awsRegion": t.region}}
+    else:
+        mode_env += [{"name": "L2E_DDB_TABLE", "value": d.get("table_name") or "REPLACE_ME"},
+                     {"name": "L2E_STREAM_ARN", "value": d.get("stream_arn") or ""}]
+        scaler = {"type": "aws-dynamodb-streams", "metadata": {
+            "tableName": d.get("table_name") or "REPLACE_ME", "shardCount": "1", "awsRegion": t.region}}
+    grace = plan.spec.timeout_s + 40  # finish the batch in flight, checkpoint, release the leases
+    return [
+        _deployment(plan, w, 0 if not t.live else 1, _pod_spec(plan, w, mode_env, t.region, http=False, grace=grace)),
+        _keda_auth(plan, w, t),
+        _scaled_object(plan, w, t, 1, plan.stream_max_replicas, scaler),
+    ]
+
+
+def schedule_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
     d = w.trigger.details
     try:
         cron, warns = to_k8s_cron(d["expression"])
     except ScheduleError as e:
         cron, warns = "0 0 31 2 *", [f"{e}; the CronJob is set to a date that never occurs and suspended until you fix it"]
         d["suspended"] = True
-    plan.spec.warnings.extend(warns)
+    plan.spec.warnings.extend(w_ for w_ in warns if w_ not in plan.spec.warnings)
     mode_env = []
     if d.get("input"):
         mode_env.append({"name": "L2E_SCHEDULE_INPUT", "value": d["input"]})
     if d.get("rule_arn"):
         mode_env.append({"name": "L2E_SCHEDULE_RULE_ARN", "value": d["rule_arn"]})
-    pod = _pod_spec(plan, w, mode_env, region, http=False, restart="Never")
+    pod = _pod_spec(plan, w, mode_env, t.region, http=False, restart="Never")
     labels = _labels(plan, w.name)
+    annotations = {"lambda2eks/eventbridge-schedule": d["expression"]}
+    if d.get("suspended"):
+        annotations["lambda2eks/note"] = "the EventBridge schedule was disabled; keep this suspended"
     return [{
         "apiVersion": "batch/v1", "kind": "CronJob",
-        "metadata": {"name": w.name, "labels": labels, "annotations": {"lambda2eks/eventbridge-schedule": d["expression"]}},
+        "metadata": {"name": w.name, "labels": labels, "annotations": annotations},
         "spec": {
-            "schedule": cron, "timeZone": "Etc/UTC", "suspend": bool(d.get("suspended")),
+            # Suspended until the cut-over disables the EventBridge rule, so the job never runs twice.
+            "schedule": cron, "timeZone": "Etc/UTC", "suspend": bool(d.get("suspended")) or not t.live,
             "concurrencyPolicy": plan.schedule_concurrency_policy, "startingDeadlineSeconds": 300,
             "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 3,
             "jobTemplate": {"spec": {
@@ -322,8 +402,10 @@ def schedule_docs(plan: Plan, w: Workload, region: str) -> list[dict[str, Any]]:
     }]
 
 
-def manifests(plan: Plan, namespace: str, region: str, iam_mode: str) -> dict[str, list[dict[str, Any]]]:
+def manifests(plan: Plan, namespace: str, region: str, iam_mode: str, live: bool = False,
+              certificate_arn: str | None = None) -> dict[str, list[dict[str, Any]]]:
     spec = plan.spec
+    t = Target(plan, namespace, region, iam_mode, live, certificate_arn)
     sa: dict[str, Any] = {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": plan.k8s_name, "labels": _labels(plan)}}
     if iam_mode == "irsa":
         sa["metadata"]["annotations"] = {"eks.amazonaws.com/role-arn": spec.role_arn or "REPLACE_ME"}
@@ -341,11 +423,13 @@ def manifests(plan: Plan, namespace: str, region: str, iam_mode: str) -> dict[st
         }]
     for w in plan.workloads:
         if w.kind in (HTTP, INVOKE):
-            files[f"{w.name}.yaml"] = http_docs(plan, w, region)
-        elif w.kind == SQS:
-            files[f"{w.name}.yaml"] = sqs_docs(plan, w, region, iam_mode)
+            files[f"{w.name}.yaml"] = http_docs(plan, w, t)
+        elif w.kind in (SQS, *BRIDGED):
+            files[f"{w.name}.yaml"] = sqs_docs(plan, w, t)
+        elif w.kind in STREAMS:
+            files[f"{w.name}.yaml"] = stream_docs(plan, w, t)
         elif w.kind == SCHEDULE:
-            files[f"{w.name}.yaml"] = schedule_docs(plan, w, region)
+            files[f"{w.name}.yaml"] = schedule_docs(plan, w, t)
     return files
 
 
@@ -369,6 +453,115 @@ def trust_policy(plan: Plan, namespace: str, iam_mode: str) -> dict[str, Any]:
     return {"Version": "2012-10-17", "Statement": statements}
 
 
+# ------------------------------------------------------------------ AWS resources the workloads need
+
+def _cfn_id(name: str) -> str:
+    return "".join(part.capitalize() for part in re.split(r"[^A-Za-z0-9]+", name) if part)[:200]
+
+
+def infra_stack(plan: Plan, t: Target) -> dict[str, Any] | None:
+    """CloudFormation for the bridge queues (S3/SNS -> SQS) and the stream lease table, or None if neither is needed."""
+    bridged = [w for w in plan.workloads if w.kind in BRIDGED]
+    streams = [w for w in plan.workloads if w.kind in STREAMS]
+    if not bridged and not streams:
+        return None
+    resources: dict[str, Any] = {}
+    outputs: dict[str, Any] = {}
+    params: dict[str, Any] = {}
+    conditions: dict[str, Any] = {}
+    # Lambda gives an asynchronous event 3 tries (1 + 2 retries); visibility covers a run with room to spare.
+    visibility = min(max(30, plan.spec.timeout_s * 6), 43200)
+    for w in bridged:
+        rid = _cfn_id(w.name)
+        resources[f"{rid}Dlq"] = {"Type": "AWS::SQS::Queue", "Properties": {
+            "QueueName": f"{w.bridge_queue}-dlq"[:80], "MessageRetentionPeriod": 1209600}}
+        resources[f"{rid}Queue"] = {"Type": "AWS::SQS::Queue", "Properties": {
+            "QueueName": w.bridge_queue, "VisibilityTimeout": visibility, "MessageRetentionPeriod": 1209600,
+            "RedrivePolicy": {"deadLetterTargetArn": {"Fn::GetAtt": [f"{rid}Dlq", "Arn"]}, "maxReceiveCount": 3}}}
+        d = w.trigger.details
+        if w.kind == S3:
+            principal, source = "s3.amazonaws.com", f"arn:aws:s3:::{d.get('bucket')}"
+        else:
+            principal, source = "sns.amazonaws.com", d.get("topic_arn") or "REPLACE_ME_TOPIC_ARN"
+        condition: dict[str, Any] = {"ArnLike": {"aws:SourceArn": source}}
+        if w.kind == S3:
+            condition["StringEquals"] = {"aws:SourceAccount": {"Ref": "AWS::AccountId"}}
+        resources[f"{rid}QueuePolicy"] = {"Type": "AWS::SQS::QueuePolicy", "Properties": {
+            "Queues": [{"Ref": f"{rid}Queue"}],
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                "Sid": f"Allow{w.kind.upper()}", "Effect": "Allow", "Principal": {"Service": principal},
+                "Action": "sqs:SendMessage", "Resource": {"Fn::GetAtt": [f"{rid}Queue", "Arn"]}, "Condition": condition}]}}}
+        if w.kind == SNS:
+            # Off until the cut-over: while the Lambda is still subscribed, both would get every message.
+            params[f"{rid}Subscribe"] = {"Type": "String", "AllowedValues": ["true", "false"], "Default": "false",
+                                         "Description": f"Subscribe {w.bridge_queue} to the topic (cut-over step)"}
+            conditions[f"{rid}Subscribed"] = {"Fn::Equals": [{"Ref": f"{rid}Subscribe"}, "true"]}
+            sub: dict[str, Any] = {"Protocol": "sqs", "TopicArn": source, "Endpoint": {"Fn::GetAtt": [f"{rid}Queue", "Arn"]},
+                                   "RawMessageDelivery": False}
+            if d.get("filter_policy"):
+                fp = d["filter_policy"]
+                sub["FilterPolicy"] = json.loads(fp) if isinstance(fp, str) else fp
+            if d.get("filter_policy_scope"):
+                sub["FilterPolicyScope"] = d["filter_policy_scope"]
+            resources[f"{rid}Subscription"] = {"Type": "AWS::SNS::Subscription", "Condition": f"{rid}Subscribed", "Properties": sub}
+        outputs[f"{rid}QueueUrl"] = {"Value": {"Ref": f"{rid}Queue"}}
+        outputs[f"{rid}QueueArn"] = {"Value": {"Fn::GetAtt": [f"{rid}Queue", "Arn"]}}
+    if streams:
+        resources["LeaseTable"] = {"Type": "AWS::DynamoDB::Table", "Properties": {
+            "TableName": t.lease_table(plan), "BillingMode": "PAY_PER_REQUEST",
+            "AttributeDefinitions": [{"AttributeName": "shard", "AttributeType": "S"}],
+            "KeySchema": [{"AttributeName": "shard", "KeyType": "HASH"}]}}
+        outputs["LeaseTable"] = {"Value": {"Ref": "LeaseTable"}}
+    stack: dict[str, Any] = {"AWSTemplateFormatVersion": "2010-09-09",
+                             "Description": f"lambda2eks resources for {plan.spec.name}: S3/SNS bridge queues and stream leases"}
+    if params:
+        stack["Parameters"] = params
+    if conditions:
+        stack["Conditions"] = conditions
+    stack["Resources"] = resources
+    stack["Outputs"] = outputs
+    return stack
+
+
+def worker_policy(plan: Plan, t: Target) -> dict[str, Any] | None:
+    """Permissions the EKS workers need on top of what the Lambda's role already has."""
+    statements = []
+    queues = [t.queue_arn(w.bridge_queue) for w in plan.workloads if w.kind in BRIDGED]
+    if queues:
+        statements.append({"Sid": "BridgeQueues", "Effect": "Allow", "Resource": queues, "Action": [
+            "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]})
+    streams = [w for w in plan.workloads if w.kind in STREAMS]
+    if streams:
+        statements.append({"Sid": "StreamLeases", "Effect": "Allow", "Resource": t.lease_table_arn(plan), "Action": [
+            "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan", "dynamodb:DescribeTable"]})
+    for w in streams:
+        d = w.trigger.details
+        if w.kind == KINESIS:
+            arn = d.get("stream_arn") or f"arn:aws:kinesis:{t.region}:{t.account}:stream/{d.get('stream_name') or 'REPLACE_ME'}"
+            statements.append({"Sid": _cfn_id(w.name), "Effect": "Allow", "Resource": arn, "Action": [
+                "kinesis:ListShards", "kinesis:GetShardIterator", "kinesis:GetRecords",
+                "kinesis:DescribeStream", "kinesis:DescribeStreamSummary"]})
+        else:
+            table = f"arn:aws:dynamodb:{t.region}:{t.account}:table/{d.get('table_name') or 'REPLACE_ME'}"
+            statements.append({"Sid": _cfn_id(w.name), "Effect": "Allow", "Resource": [table, f"{table}/stream/*"], "Action": [
+                "dynamodb:DescribeTable", "dynamodb:DescribeStream", "dynamodb:GetShardIterator",
+                "dynamodb:GetRecords", "dynamodb:ListStreams"]})
+    return {"Version": "2012-10-17", "Statement": statements} if statements else None
+
+
+def s3_queue_configs(plan: Plan, t: Target) -> dict[str, list[dict[str, Any]]]:
+    """bucket -> the QueueConfigurations that replace this function's Lambda notifications at the cut-over."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for w in (w for w in plan.workloads if w.kind == S3):
+        d = w.trigger.details
+        cfg: dict[str, Any] = {"Id": f"lambda2eks-{w.name}"[:64], "QueueArn": t.queue_arn(w.bridge_queue),
+                               "Events": d.get("events") or ["s3:ObjectCreated:*"]}
+        if d.get("filter_rules"):
+            cfg["Filter"] = {"Key": {"FilterRules": [{"Name": r.get("Name"), "Value": r.get("Value")} for r in d["filter_rules"]]}}
+        out.setdefault(d.get("bucket") or "REPLACE_ME_BUCKET", []).append(cfg)
+    return out
+
+
 # ------------------------------------------------------------------ report
 
 def _md_cell(v: Any) -> str:
@@ -376,8 +569,11 @@ def _md_cell(v: Any) -> str:
     return text.replace("|", "\\|").replace("\n", " ") or "—"
 
 
-def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict[str, Any]]], patch_files: list[str]) -> str:
-    spec = plan.spec
+def report(plan: Plan, t: Target, files: dict[str, list[dict[str, Any]]], patch_files: list[str],
+           extra: dict[str, Any] | None = None) -> str:
+    """extra: "infra" (stack or None), "worker_policy" (or None), "s3" (bucket -> queue configs), "helm" (bool)."""
+    spec, namespace, iam_mode = plan.spec, t.namespace, t.iam_mode
+    extra = extra or {}
     out = [f"# {spec.name} → EKS", ""]
     if not plan.supported:
         out += [f"**Not generated:** {plan.unsupported_reason}", ""]
@@ -393,6 +589,11 @@ def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict
     for w in plan.workloads:
         src = {HTTP: lambda: ", ".join(w.trigger.details["sources"]) + f" (payload {w.trigger.details['event_format']})",
                SQS: lambda: w.trigger.details.get("queue_arn") or "SQS queue (unresolved)",
+               S3: lambda: f"S3 bucket {w.trigger.details.get('bucket')} {', '.join(w.trigger.details.get('events') or [])} "
+                           f"via bridge queue {w.bridge_queue}",
+               SNS: lambda: f"SNS topic {w.trigger.details.get('topic_arn')} via bridge queue {w.bridge_queue}",
+               KINESIS: lambda: f"Kinesis stream {w.trigger.details.get('stream_name') or w.trigger.details.get('stream_arn')}",
+               DYNAMODB: lambda: f"DynamoDB stream of table {w.trigger.details.get('table_name')}",
                SCHEDULE: lambda: w.trigger.details["expression"],
                INVOKE: lambda: "direct Invoke API calls"}[w.kind]()
         k8s = ", ".join(d["kind"] for d in files.get(f"{w.name}.yaml", []))
@@ -403,7 +604,8 @@ def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict
     kinds = {w.kind for w in plan.workloads}
     relevant = {
         "http_min_replicas": kinds & {HTTP, INVOKE}, "http_max_replicas": kinds & {HTTP, INVOKE},
-        "ingress_scheme": kinds & {HTTP}, "sqs_max_replicas": kinds & {SQS}, "schedule_concurrency_policy": kinds & {SCHEDULE},
+        "ingress_scheme": kinds & {HTTP}, "sqs_max_replicas": kinds & {SQS, *BRIDGED},
+        "stream_max_replicas": kinds & set(STREAMS), "schedule_concurrency_policy": kinds & {SCHEDULE},
     }
     for d in plan.decisions.values():
         if d.setting in relevant and not relevant[d.setting]:
@@ -416,7 +618,7 @@ def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict
         out += ["## Findings", ""]
         for f in plan.findings:
             loc = f" — `{f['file']}" + (f":{f['line']}" if f.get("line") else "") + "`" if f.get("file") else ""
-            out += [f"- **{f['severity'].upper()}** {f['title']}{loc}", f"  {f['detail']}"]
+            out += [f"- **{f['severity'].upper()}** {f['title']}{loc}", f"  {f.get('detail') or ''}"]
         out.append("")
     if patch_files:
         out += ["## Suggested code changes", "", "Written for review, not applied. Check each one, then apply it with `git apply`:", ""]
@@ -433,11 +635,24 @@ def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict
         not_migrated.append("API Gateway features (authorizers, API keys, usage plans, throttling, CORS, custom domains) are not reproduced by the Ingress.")
     if plan.unsupported_triggers:
         advice = {a["trigger"]: a["recommendation"] for a in plan.trigger_advice}
-        for t in plan.unsupported_triggers:
-            rec = next((v for k, v in advice.items() if t.details.get("source", "") in k or t.details.get("detail", "") in k), None)
-            not_migrated.append(f"Trigger not migrated: {t.details.get('detail')}" + (f" — AI advice: {rec}" if rec else ""))
+        for tr in plan.unsupported_triggers:
+            rec = next((v for k, v in advice.items() if tr.details.get("source", "") in k or tr.details.get("detail", "") in k), None)
+            not_migrated.append(f"Trigger not migrated: {tr.details.get('detail')}" + (f" — AI advice: {rec}" if rec else ""))
     if not_migrated:
         out += ["## Not migrated", ""] + [f"- {x}" for x in not_migrated] + [""]
+
+    if extra.get("infra"):
+        out += ["## AWS resources", "",
+                "`infra/resources.yaml` creates what EKS needs that the Lambda did not: "
+                + ", ".join(x for x in [
+                    "a bridge SQS queue (with a DLQ after 3 tries, like Lambda's async retries) for each S3/SNS trigger" if kinds & set(BRIDGED) else "",
+                    f"the lease table `{t.lease_table(plan)}` where stream workers share out shards and keep checkpoints" if kinds & set(STREAMS) else "",
+                ] if x) + ". Deploying it changes nothing for the Lambda"
+                + ("; SNS subscriptions stay off until the cut-over." if SNS in kinds else "."), "",
+                *(["```bash", f"aws cloudformation deploy --stack-name lambda2eks-{plan.k8s_name} --template-file infra/resources.yaml", "```", ""])]
+        if extra.get("s3"):
+            out += ["The S3 notifications move to the queues at the cut-over, from "
+                    + ", ".join(f"`infra/s3-{b}-queue-config.json`" for b in extra["s3"]) + ".", ""]
 
     role = spec.role_arn or "ROLE_ARN"
     role_name = role.split("/")[-1]
@@ -447,24 +662,37 @@ def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict
     if iam_mode == "pod-identity":
         out += [f"aws eks create-pod-identity-association --cluster-name CLUSTER --namespace {namespace} \\",
                 f"  --service-account {plan.k8s_name} --role-arn {role}"]
+    if extra.get("worker_policy"):
+        out.append(f"aws iam put-role-policy --role-name {role_name} --policy-name lambda2eks-worker --policy-document file://iam/worker-policy.json")
     out += ["```", ""]
+    if extra.get("worker_policy"):
+        out += ["`iam/worker-policy.json` adds what the workers need beyond the Lambda's role: the bridge queues, "
+                "the lease table and the stream reads that Lambda did for the function.", ""]
     if plan.iam_actions:
         out += ["The AI review found the code calling these actions. Compare them with the role's policies for least privilege:", "",
                 ", ".join(f"`{a}`" for a in plan.iam_actions), ""]
-    if any(w.kind == SQS for w in plan.workloads):
-        out += ["KEDA reads queue depth with the same role. " + (
+    if kinds & {SQS, *BRIDGED, *STREAMS}:
+        out += ["KEDA reads queue depth and shard counts with the same role. " + (
             "With `identityOwner: workload` it uses the ServiceAccount's IRSA role." if iam_mode == "irsa" else
             "With Pod Identity, the KEDA operator's own role must be allowed to `sts:AssumeRole` into this role."), ""]
 
     out += ["## Build and deploy", "", "```bash", "./build.sh                      # builds and pushes " + plan.image,
-            "kubectl apply -k k8s/", "```", ""]
-    placeholders = sorted({m for docs in files.values() for m in re.findall(r"REPLACE_ME\w*", dump_yaml(docs))})
+            "kubectl apply -k k8s/" + (f"          # or: helm upgrade --install {plan.k8s_name} helm/ -n {namespace}" if extra.get("helm") else ""),
+            "```", ""]
+    if kinds - {HTTP, INVOKE}:
+        out += ["**Applying moves no events.** " + (
+            "Queue and stream workers start paused and CronJobs start suspended. `CUTOVER.md` switches each trigger, with a rollback."
+            if not t.live else "Generated with `--live`: workers and CronJobs start active. Do not run them while the Lambda still has its triggers."), ""]
+    else:
+        out += ["`CUTOVER.md` moves the traffic in weighted steps, with a rollback.", ""]
+    texts = [dump_yaml(docs) for docs in files.values()] + [json.dumps(extra.get(k)) for k in ("infra", "worker_policy", "s3")]
+    placeholders = sorted({m for text in texts for m in re.findall(r"REPLACE_ME\w*", text)})
     if placeholders or plan.secret_env_keys:
         out += ["Before applying, fill in:", ""]
         if plan.secret_env_keys:
             out.append(f"- Secret values in `k8s/secret.yaml`: {', '.join(plan.secret_env_keys)}")
         if placeholders:
-            out.append(f"- Placeholders in `k8s/`: {', '.join(placeholders)}")
+            out.append(f"- Placeholders in `k8s/`, `infra/` and `iam/`: {', '.join(placeholders)}")
         out.append("")
     notes = spec.warnings + plan.ai_notes
     if notes:
@@ -472,7 +700,12 @@ def report(plan: Plan, namespace: str, iam_mode: str, files: dict[str, list[dict
     out += ["## Behaviour differences to know", "",
             f"- One pod runs {plan.concurrency} invocation(s) at a time." + (
                 " Lambda scaled per request; here the HPA scales on CPU, which lags behind sudden bursts." if kinds & {HTTP, INVOKE} else ""),
-            "- A timed-out invocation gets a 504 (HTTP) or a failed batch (SQS), but the handler code keeps running until it returns.",
+            "- A timed-out invocation gets a 504 (HTTP) or a failed batch (SQS, streams), but the handler code keeps running until it returns.",
+            *(["- S3 and SNS events arrive through an SQS queue: one event per invocation as before, retried on failure, "
+               "then moved to the DLQ after 3 tries. Delivery order is not guaranteed, as on Lambda."] if kinds & set(BRIDGED) else []),
+            *(["- Stream records keep their order per shard, as with Lambda (ParallelizationFactor 1). A replica that dies "
+               "mid-batch leaves the batch to be processed again by the next owner of the shard, so handlers must be idempotent."]
+              if kinds & set(STREAMS) else []),
             "- Logs go to stdout. Ship them with Fluent Bit or CloudWatch Container Insights if dashboards and alarms read CloudWatch Logs.",
             ""]
     return "\n".join(out)
@@ -482,25 +715,57 @@ def _patch_name(i: int, file: str) -> str:
     return f"{i:02d}-" + re.sub(r"[^A-Za-z0-9._-]+", "_", file)[:80] + ".diff"
 
 
-def write_plan(plan: Plan, out: Path, namespace: str, region: str | None, iam_mode: str, ai_result: dict[str, Any] | None) -> None:
+def write_plan(plan: Plan, out: Path, namespace: str, region: str | None, iam_mode: str, ai_result: dict[str, Any] | None,
+               fmt: str = "kustomize", live: bool = False, certificate_arn: str | None = None) -> None:
+    from . import cutover, helm  # these import this module
+
     out.mkdir(parents=True, exist_ok=True)
     region = region or plan.spec.region or "REPLACE_ME_REGION"
+    t = Target(plan, namespace, region, iam_mode, live, certificate_arn)
     files: dict[str, list[dict[str, Any]]] = {}
+    extra: dict[str, Any] = {}
+    for stale in ("k8s", "helm", "infra"):
+        if (out / stale).exists():
+            shutil.rmtree(out / stale)
     if plan.supported:
         write_build_context(plan, out)
-        files = manifests(plan, namespace, region, iam_mode)
-        k8s = out / "k8s"
-        if k8s.exists():
-            shutil.rmtree(k8s)
-        k8s.mkdir()
-        for name, docs in files.items():
-            (k8s / name).write_text(dump_yaml(docs))
-        (k8s / "kustomization.yaml").write_text(dump_yaml([{
-            "apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization",
-            "namespace": namespace, "resources": sorted(files),
-        }]))
+        files = manifests(plan, namespace, region, iam_mode, live, certificate_arn)
+        if fmt in ("kustomize", "both"):
+            k8s = out / "k8s"
+            k8s.mkdir()
+            for name, docs in files.items():
+                (k8s / name).write_text(dump_yaml(docs))
+            (k8s / "kustomization.yaml").write_text(dump_yaml([{
+                "apiVersion": "kustomize.config.k8s.io/v1beta1", "kind": "Kustomization",
+                "namespace": namespace, "resources": sorted(files),
+            }]))
+        if fmt in ("helm", "both"):
+            for rel, text in helm.chart(plan, files, iam_mode).items():
+                (out / "helm" / rel).parent.mkdir(parents=True, exist_ok=True)
+                (out / "helm" / rel).write_text(text)
+            extra["helm"] = True
         (out / "iam").mkdir(exist_ok=True)
         (out / "iam" / "trust-policy.json").write_text(json.dumps(trust_policy(plan, namespace, iam_mode), indent=2) + "\n")
+        extra["infra"], extra["worker_policy"], extra["s3"] = infra_stack(plan, t), worker_policy(plan, t), s3_queue_configs(plan, t)
+        if extra["worker_policy"]:
+            (out / "iam" / "worker-policy.json").write_text(json.dumps(extra["worker_policy"], indent=2) + "\n")
+        elif (out / "iam" / "worker-policy.json").exists():
+            (out / "iam" / "worker-policy.json").unlink()
+        if extra["infra"]:
+            (out / "infra").mkdir()
+            (out / "infra" / "resources.yaml").write_text(dump_yaml([extra["infra"]]))
+            for bucket, configs in extra["s3"].items():
+                (out / "infra" / f"s3-{bucket}-queue-config.json").write_text(json.dumps(configs, indent=2) + "\n")
+        cut = out / "cutover"
+        cut.mkdir(exist_ok=True)
+        (cut / "CUTOVER.md").write_text(cutover.runbook(plan, t, bool(extra["infra"]), bool(extra["worker_policy"])))
+        http = [w for w in plan.workloads if w.kind == HTTP]
+        script = cut / "route53-weights.sh"
+        if http:
+            script.write_text(cutover.route53_script(namespace, http[0].name))
+            script.chmod(0o755)
+        elif script.exists():
+            script.unlink()
 
     patch_files = []
     if ai_result is not None:
@@ -514,4 +779,4 @@ def write_plan(plan: Plan, out: Path, namespace: str, region: str | None, iam_mo
             patch = change["patch"] if change["patch"].endswith("\n") else change["patch"] + "\n"
             (ai_dir / "patches" / name).write_text(f"# {change['description']}\n{patch}")
             patch_files.append(f"ai/patches/{name}")
-    (out / "MIGRATION.md").write_text(report(plan, namespace, iam_mode, files, patch_files))
+    (out / "MIGRATION.md").write_text(report(plan, t, files, patch_files, extra))

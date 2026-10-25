@@ -53,7 +53,7 @@ def test_trust_policy_keeps_lambda(sample_specs):
 
 
 def test_cli_end_to_end_with_ai(tmp_path, monkeypatch):
-    def fake_review(plan, model, effort):
+    def fake_review(plan, model, effort, provider):
         plan.ai_model = model
         settings = {k: {"value": None, "reason": "fine"} for k in ai.SETTINGS}
         if plan.spec.name == "orders-api":
@@ -66,12 +66,14 @@ def test_cli_end_to_end_with_ai(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ai, "review", fake_review)
     out = tmp_path / "out"
-    assert cli.main(["from-template", str(SAMPLE), "--out", str(out)]) == 0
+    assert cli.main(["from-template", str(SAMPLE), "--out", str(out), "--provider", "anthropic"]) == 0
     report = (out / "orders-api" / "MIGRATION.md").read_text()
     assert "| concurrency | 4 | AI (rule said 1) |" in report
     assert "1 blocker(s)" in report and "ai/patches/01-app.py.diff" in report
     assert (out / "orders-api" / "ai" / "patches" / "01-app.py.diff").is_file()
-    assert "send S3 events to SQS" in (out / "order-worker" / "MIGRATION.md").read_text()
+    worker = (out / "order-worker" / "MIGRATION.md").read_text()
+    assert "via bridge queue l2e-order-worker-s3-" in worker and "Trigger not migrated" not in worker
+    assert (out / "order-worker" / "cutover" / "CUTOVER.md").is_file()
     deploy = by_kind(load_all(out / "orders-api" / "k8s" / "orders-api-http.yaml"))["Deployment"]
     env = {e["name"]: e["value"] for e in deploy["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert env["L2E_CONCURRENCY"] == "4"
@@ -82,10 +84,10 @@ def test_cli_end_to_end_with_ai(tmp_path, monkeypatch):
 
 
 def test_cli_fails_loudly_when_ai_fails(tmp_path, monkeypatch):
-    def broken(plan, model, effort):
+    def broken(plan, model, effort, provider):
         raise ai.AIReviewError("no credentials")
 
     monkeypatch.setattr(ai, "review", broken)
     out = tmp_path / "out"
-    assert cli.main(["from-template", str(SAMPLE), "--out", str(out), "--function", "orders-api"]) == 1
+    assert cli.main(["from-template", str(SAMPLE), "--out", str(out), "--function", "orders-api", "--provider", "anthropic"]) == 1
     assert "AI REVIEW FAILED: no credentials" in (out / "orders-api" / "MIGRATION.md").read_text()

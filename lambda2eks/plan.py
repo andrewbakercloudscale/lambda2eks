@@ -6,18 +6,19 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .model import HTTP, INVOKE, SCHEDULE, SQS, UNSUPPORTED, FunctionSpec, Trigger
+from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SQS, STREAMS, UNSUPPORTED, FunctionSpec, Trigger
 
 LAMBDA_MB_PER_VCPU = 1769  # Lambda allocates one full vCPU at 1,769 MB
-SECRET_KEY = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|API_?KEY|PRIVATE|CREDENTIAL|DSN|CONN(ECTION)?_?STR)", re.I)
+SECRET_KEY = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|API_?KEY|PRIVATE|CREDENTIAL|DSN|CONN(ECTION)?_?STR|WEBHOOK)", re.I)
 MAX_REPLICAS_CAP = 200
 
 
 @dataclass
 class Workload:
-    kind: str            # http | invoke | sqs | schedule
+    kind: str            # http | invoke | sqs | schedule | s3 | sns | kinesis | dynamodb
     name: str            # Kubernetes object name
     trigger: Trigger | None
+    bridge_queue: str | None = None  # s3/sns: the SQS queue lambda2eks puts between the source and the worker
 
 
 @dataclass
@@ -42,6 +43,7 @@ class Plan:
     http_min_replicas: int = 2
     http_max_replicas: int = 10
     sqs_max_replicas: int = 20
+    stream_max_replicas: int = 4
     ingress_scheme: str = "internal"
     schedule_concurrency_policy: str = "Allow"
     secret_env_keys: list[str] = field(default_factory=list)
@@ -63,6 +65,14 @@ class Plan:
         baseline = prev.value if prev and source == "ai" else None
         setattr(self, setting, value)
         self.decisions[setting] = Decision(setting, value, source, reason, baseline)
+
+
+def _unique(plan: Plan, name: str) -> str:
+    taken = {w.name for w in plan.workloads}
+    n, i = name, 2
+    while n in taken:
+        n, i = f"{name[:48]}-{i}", i + 1
+    return n
 
 
 def k8s_name(name: str) -> str:
@@ -96,9 +106,11 @@ def baseline_plan(spec: FunctionSpec, registry: str) -> Plan:
         cap = min(spec.reserved_concurrency, MAX_REPLICAS_CAP)
         plan.decide("http_max_replicas", cap, "rule", f"reserved concurrency {spec.reserved_concurrency} at 1 request per pod")
         plan.decide("sqs_max_replicas", cap, "rule", f"reserved concurrency {spec.reserved_concurrency} at 1 batch per pod")
+        plan.decide("stream_max_replicas", cap, "rule", f"reserved concurrency {spec.reserved_concurrency}; KEDA also caps at one pod per shard")
     else:
         plan.decide("http_max_replicas", 10, "rule", "no reserved concurrency set; conservative ceiling")
         plan.decide("sqs_max_replicas", 20, "rule", "no reserved concurrency set; conservative ceiling")
+        plan.decide("stream_max_replicas", 4, "rule", "no reserved concurrency set; KEDA scales with the shard count up to this")
     plan.decide("http_min_replicas", 2, "rule", "two replicas for availability across nodes")
     plan.decide("ingress_scheme", "internal", "rule", "internal load balancer until someone decides it should be public")
     plan.decide("schedule_concurrency_policy", "Allow", "rule", "EventBridge lets scheduled invocations overlap")
@@ -124,6 +136,13 @@ def baseline_plan(spec: FunctionSpec, registry: str) -> Plan:
         plan.workloads.append(Workload(SQS, f"{name}-sqs-{k8s_name(qname)}"[:52].rstrip("-"), t))
     for i, t in enumerate(t for t in spec.triggers if t.kind == SCHEDULE):
         plan.workloads.append(Workload(SCHEDULE, f"{name}-cron-{i}" if i else f"{name}-cron", t))
+    for t in (t for t in spec.triggers if t.kind in BRIDGED):
+        source = t.details.get("bucket") if t.kind == "s3" else (t.details.get("topic_arn") or "topic").split(":")[-1]
+        wname = _unique(plan, f"{name}-{t.kind}-{k8s_name(source or t.kind)}"[:52].rstrip("-"))
+        plan.workloads.append(Workload(t.kind, wname, t, bridge_queue=f"l2e-{wname}"[:80]))
+    for t in (t for t in spec.triggers if t.kind in STREAMS):
+        source = t.details.get("stream_name") or t.details.get("table_name") or "stream"
+        plan.workloads.append(Workload(t.kind, _unique(plan, f"{name}-{t.kind}-{k8s_name(source)}"[:52].rstrip("-")), t))
     plan.unsupported_triggers = [t for t in spec.triggers if t.kind == UNSUPPORTED]
     if not plan.workloads:
         plan.workloads.append(Workload(INVOKE, f"{name}-invoke", None))

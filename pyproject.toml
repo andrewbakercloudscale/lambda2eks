@@ -7,7 +7,7 @@ name = "lambda2eks"
 version = "0.1.0"
 description = "Migrate AWS Lambda functions to EKS workloads, with Claude reviewing each function's code to make the migration decisions."
 requires-python = ">=3.10"
-dependencies = ["pyyaml>=6", "anthropic>=2.3"]
+dependencies = ["pyyaml>=6", "anthropic>=2.3", "truststore>=0.10"]
 
 [project.optional-dependencies]
 aws = ["boto3>=1.34"]
@@ -20,4 +20,4 @@ lambda2eks = "lambda2eks.cli:main"
 include = ["lambda2eks*"]
 
 [tool.setuptools.package-data]
-lambda2eks = ["shims/*"]
+lambda2eks = ["shims/*", "templates/*"]

@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from ..model import HTTP, SCHEDULE, SQS, UNSUPPORTED, FunctionSpec, Trigger
+from ..model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SNS, SQS, UNSUPPORTED, FunctionSpec, Trigger
 
 
 class _CfnLoader(yaml.SafeLoader):
@@ -31,7 +31,7 @@ def _intrinsic(loader: yaml.Loader, suffix: str, node: yaml.Node) -> dict[str, A
 _CfnLoader.add_multi_constructor("!", lambda l, s, n: _intrinsic(l, s, n))
 
 _UNSUPPORTED_EVENTS = {
-    "S3": "s3", "SNS": "sns", "DynamoDB": "dynamodb", "Kinesis": "kinesis", "MSK": "kafka",
+    "MSK": "kafka",
     "SelfManagedKafka": "kafka", "MQ": "mq", "EventBridgeRule": "eventbridge-rule",
     "CloudWatchEvent": "eventbridge-rule", "CloudWatchLogs": "cloudwatch-logs", "IoTRule": "iot",
     "AlexaSkill": "alexa", "Cognito": "cognito", "DocumentDB": "documentdb",
@@ -132,11 +132,12 @@ def _to_spec(logical_id: str, name: str, rtype: str, props: dict[str, Any],
         if props.get("FunctionUrlConfig"):
             spec.triggers.append(Trigger(HTTP, {"method": "ANY", "path": None, "event_format": "2.0", "source": "function-url"}))
     spec.triggers.extend(_cfn_triggers(logical_id, resources, warnings))
-    # A template has no region of its own; a queue ARN is the one place it shows up.
+    # A template has no region of its own; a resource ARN is the one place it shows up.
     for t in spec.triggers:
-        arn = t.details.get("queue_arn") or ""
+        arn = t.details.get("queue_arn") or t.details.get("stream_arn") or t.details.get("topic_arn") or ""
         if arn.startswith("arn:aws") and "REPLACE_ME" not in arn:
             spec.region = arn.split(":")[3]
+            spec.account_id = spec.account_id or arn.split(":")[4] or None
             break
     return spec
 
@@ -173,11 +174,28 @@ def _sam_event(ev_id: str, ev: dict[str, Any], resources: dict[str, Any], warnin
         return [Trigger(HTTP, {"method": str(p.get("Method", "ANY")).upper(), "path": p.get("Path"), "event_format": fmt, "source": "api-gateway-http"})]
     if etype == "SQS":
         arn, url = _queue_ref(p.get("Queue"), resources, warnings)
+        _warn_filter(ev_id, p, warnings)
         return [Trigger(SQS, {
             "queue_arn": arn, "queue_url": url,
             "batch_size": int(p.get("BatchSize", 10)),
             "report_batch_item_failures": "ReportBatchItemFailures" in (p.get("FunctionResponseTypes") or []),
+            "filter_criteria": p.get("FilterCriteria"),
         })]
+    if etype == "S3":
+        bucket = _bucket_name(p.get("Bucket"), resources, warnings)
+        events = p.get("Events")
+        rules = ((p.get("Filter") or {}).get("S3Key") or {}).get("Rules") or []
+        return [Trigger(S3, {"bucket": bucket, "events": [events] if isinstance(events, str) else list(events or []),
+                             "filter_rules": rules, "detail": f"SAM event {ev_id} (S3)"})]
+    if etype == "SNS":
+        if p.get("SqsSubscription"):
+            warnings.append(f"event {ev_id}: SqsSubscription already puts a queue between SNS and the function; "
+                            "the function receives SQS records, so treat it as an SQS consumer of that queue")
+        return [Trigger(SNS, {"topic_arn": _topic_arn(p.get("Topic"), resources, warnings),
+                              "filter_policy": p.get("FilterPolicy"), "filter_policy_scope": p.get("FilterPolicyScope"),
+                              "detail": f"SAM event {ev_id} (SNS)"})]
+    if etype in ("Kinesis", "DynamoDB"):
+        return [_stream_trigger(KINESIS if etype == "Kinesis" else DYNAMODB, p.get("Stream"), p, resources, warnings, f"event {ev_id}")]
     if etype in ("Schedule", "ScheduleV2"):
         expr = p.get("Schedule") or p.get("ScheduleExpression")
         if not isinstance(expr, str):
@@ -199,10 +217,15 @@ def _cfn_triggers(logical_id: str, resources: dict[str, Any], warnings: list[str
         if res.get("Type") == "AWS::Lambda::EventSourceMapping" and _refers_to(p.get("FunctionName"), logical_id):
             src = p.get("EventSourceArn")
             src_text = src if isinstance(src, str) else json.dumps(src)
+            kind = _stream_kind(src, resources)
             if ":sqs:" in src_text or _is_queue_ref(src, resources):
                 arn, url = _queue_ref(src, resources, warnings)
+                _warn_filter(rid, p, warnings)
                 out.append(Trigger(SQS, {"queue_arn": arn, "queue_url": url, "batch_size": int(p.get("BatchSize", 10)),
-                                         "report_batch_item_failures": "ReportBatchItemFailures" in (p.get("FunctionResponseTypes") or [])}))
+                                         "report_batch_item_failures": "ReportBatchItemFailures" in (p.get("FunctionResponseTypes") or []),
+                                         "filter_criteria": p.get("FilterCriteria")}))
+            elif kind:
+                out.append(_stream_trigger(kind, src, p, resources, warnings, f"EventSourceMapping {rid}"))
             else:
                 out.append(Trigger(UNSUPPORTED, {"source": "stream", "detail": f"EventSourceMapping {rid} from {src_text}"}))
         if res.get("Type") == "AWS::Events::Rule":
@@ -214,7 +237,99 @@ def _cfn_triggers(logical_id: str, resources: dict[str, Any], warnings: list[str
                                                   "suspended": p.get("State") == "DISABLED"}))
                 else:
                     out.append(Trigger(UNSUPPORTED, {"source": "eventbridge-rule", "detail": f"Events rule {rid} (event pattern)"}))
+        if res.get("Type") == "AWS::SNS::Subscription" and p.get("Protocol") == "lambda" and _refers_to(p.get("Endpoint"), logical_id):
+            out.append(Trigger(SNS, {"topic_arn": _topic_arn(p.get("TopicArn"), resources, warnings),
+                                     "filter_policy": p.get("FilterPolicy"), "filter_policy_scope": p.get("FilterPolicyScope"),
+                                     "detail": f"SNS subscription {rid}"}))
+        if res.get("Type") == "AWS::SNS::Topic":
+            for sub in p.get("Subscription") or []:
+                if sub.get("Protocol") == "lambda" and _refers_to(sub.get("Endpoint"), logical_id):
+                    out.append(Trigger(SNS, {"topic_arn": _topic_arn({"Ref": rid}, resources, warnings), "detail": f"SNS topic {rid}"}))
+        if res.get("Type") == "AWS::S3::Bucket":
+            for cfg in (p.get("NotificationConfiguration") or {}).get("LambdaConfigurations") or []:
+                if _refers_to(cfg.get("Function"), logical_id):
+                    out.append(Trigger(S3, {"bucket": _bucket_name({"Ref": rid}, resources, warnings), "events": [cfg.get("Event")],
+                                            "filter_rules": ((cfg.get("Filter") or {}).get("S3Key") or {}).get("Rules") or [],
+                                            "detail": f"S3 bucket {rid} notification"}))
     return out
+
+
+def _warn_filter(where: str, p: dict[str, Any], warnings: list[str]) -> None:
+    if p.get("FilterCriteria"):
+        warnings.append(f"{where}: FilterCriteria is not applied on EKS, so the handler sees every record; "
+                        "filter in the handler or upstream")
+
+
+def _stream_kind(src: Any, resources: dict[str, Any]) -> str | None:
+    text = src if isinstance(src, str) else json.dumps(src)
+    if ":kinesis:" in text:
+        return KINESIS
+    if ":dynamodb:" in text:
+        return DYNAMODB
+    rid = _ref_id(src)
+    rtype = (resources.get(rid) or {}).get("Type") if rid else None
+    return {"AWS::Kinesis::Stream": KINESIS, "AWS::DynamoDB::Table": DYNAMODB}.get(rtype)
+
+
+def _stream_trigger(kind: str, src: Any, p: dict[str, Any], resources: dict[str, Any], warnings: list[str], where: str) -> Trigger:
+    details: dict[str, Any] = {
+        "starting_position": p.get("StartingPosition", "LATEST"),
+        "starting_timestamp": p.get("StartingPositionTimestamp"),
+        "batch_size": int(p.get("BatchSize", 100)),
+        "max_retry_attempts": p.get("MaximumRetryAttempts", -1),
+        "bisect_on_error": bool(p.get("BisectBatchOnFunctionError")),
+        "report_batch_item_failures": "ReportBatchItemFailures" in (p.get("FunctionResponseTypes") or []),
+        "parallelization_factor": int(p.get("ParallelizationFactor", 1)),
+        "filter_criteria": p.get("FilterCriteria"),
+        "detail": f"{where} ({kind} stream)",
+    }
+    _warn_filter(where, p, warnings)
+    if details["parallelization_factor"] > 1:
+        warnings.append(f"{where}: ParallelizationFactor {details['parallelization_factor']} is not reproduced; "
+                        "the consumer runs one batch per shard at a time")
+    if p.get("TumblingWindowInSeconds"):
+        warnings.append(f"{where}: tumbling windows are not reproduced; the handler gets no state between batches")
+    if p.get("DestinationConfig"):
+        warnings.append(f"{where}: the on-failure destination is not reproduced; records that exhaust their retries are logged and skipped")
+    arn = src if isinstance(src, str) and src.startswith("arn:aws") else None
+    rid = _ref_id(src)
+    props = ((resources.get(rid) or {}).get("Properties") or {}) if rid else {}
+    if kind == KINESIS:
+        name = arn.split("/", 1)[1] if arn else props.get("Name") if isinstance(props.get("Name"), str) else None
+        if not arn and name:
+            arn = f"arn:aws:kinesis:REPLACE_ME_REGION:REPLACE_ME_ACCOUNT:stream/{name}"
+        details.update(stream_arn=arn, stream_name=name)
+    else:
+        table = arn.split(":table/", 1)[1].split("/")[0] if arn and ":table/" in arn else (
+            props.get("TableName") if isinstance(props.get("TableName"), str) else None)
+        # A stream ARN ends in a timestamp label the template cannot know; the consumer looks it up from the table.
+        details.update(stream_arn=arn if arn and "/stream/" in arn else None, table_name=table)
+    if not (details.get("stream_name") or details.get("table_name")):
+        warnings.append(f"{where}: stream {_describe(src)} could not be resolved; set L2E_STREAM_NAME or L2E_DDB_TABLE by hand")
+    return Trigger(kind, details)
+
+
+def _bucket_name(value: Any, resources: dict[str, Any], warnings: list[str]) -> str:
+    if isinstance(value, str):
+        return value
+    rid = _ref_id(value)
+    name = (((resources.get(rid) or {}).get("Properties") or {}).get("BucketName")) if rid else None
+    if isinstance(name, str):
+        return name
+    warnings.append(f"bucket {rid or _describe(value)} has a generated name; replace REPLACE_ME_BUCKET with the real name")
+    return "REPLACE_ME_BUCKET"
+
+
+def _topic_arn(value: Any, resources: dict[str, Any], warnings: list[str]) -> str:
+    if isinstance(value, str):
+        return value
+    rid = _ref_id(value)
+    name = (((resources.get(rid) or {}).get("Properties") or {}).get("TopicName")) if rid else None
+    if isinstance(name, str):
+        warnings.append(f"topic {rid} is created by the template; its ARN needs your account and region (REPLACE_ME placeholders)")
+        return f"arn:aws:sns:REPLACE_ME_REGION:REPLACE_ME_ACCOUNT:{name}"
+    warnings.append(f"topic {rid or _describe(value)} has a generated name; replace REPLACE_ME_TOPIC_ARN with its ARN")
+    return "REPLACE_ME_TOPIC_ARN"
 
 
 def _refers_to(value: Any, logical_id: str) -> bool:

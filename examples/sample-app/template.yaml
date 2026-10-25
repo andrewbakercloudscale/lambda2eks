@@ -77,3 +77,75 @@ Resources:
 
   UploadBucket:
     Type: AWS::S3::Bucket
+
+  StockSync:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stock-sync
+      Runtime: python3.12
+      Handler: sync.handler
+      CodeUri: stock_sync/
+      Role: arn:aws:iam::123456789012:role/stock-sync-role
+      Environment:
+        Variables:
+          SEARCH_INDEX_URL: https://search.internal.example.com/stock
+      Events:
+        Changes:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt StockTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 50
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  StockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stock
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: sku, AttributeType: S}]
+      KeySchema: [{AttributeName: sku, KeyType: HASH}]
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+
+  ClickIngest:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: click-ingest
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: click_ingest/
+      MemorySize: 256
+      Role: arn:aws:iam::123456789012:role/click-ingest-role
+      Events:
+        Clicks:
+          Type: Kinesis
+          Properties:
+            Stream: arn:aws:kinesis:eu-west-1:123456789012:stream/clicks
+            StartingPosition: LATEST
+            BatchSize: 200
+
+  AlertNotifier:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: alert-notifier
+      Runtime: python3.12
+      Handler: notify.handler
+      CodeUri: alert_notifier/
+      Role: arn:aws:iam::123456789012:role/alert-notifier-role
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: https://hooks.slack.example.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX
+      Events:
+        Alerts:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlertsTopic
+            FilterPolicy:
+              severity: [high, critical]
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: alerts

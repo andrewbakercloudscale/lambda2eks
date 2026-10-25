@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from ..model import HTTP, SCHEDULE, SQS, UNSUPPORTED, FunctionSpec, Trigger
+from ..model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SNS, SQS, UNSUPPORTED, FunctionSpec, Trigger
 from ..plan import k8s_name
 
 
@@ -20,7 +20,7 @@ def load_from_aws(names: list[str], download_to: Path, region: str | None = None
         raise SystemExit("the aws loader needs boto3: pip install 'lambda2eks[aws]'") from e
 
     session = boto3.Session(region_name=region, profile_name=profile)
-    clients = {n: session.client(n) for n in ("lambda", "events", "apigatewayv2")}
+    clients = {n: session.client(n) for n in ("lambda", "events", "apigatewayv2", "s3", "sns")}
     return [_load_one(clients, name, download_to) for name in names]
 
 
@@ -65,7 +65,7 @@ def _load_one(clients: dict[str, Any], name: str, download_to: Path) -> Function
         dead_letter_target=(cfg.get("DeadLetterConfig") or {}).get("TargetArn"),
         warnings=warnings,
     )
-    spec.triggers = _event_source_mappings(lam, name) + _policy_triggers(clients, name, arn, warnings)
+    spec.triggers = _event_source_mappings(lam, name, warnings) + _policy_triggers(clients, name, arn, warnings)
     try:
         lam.get_function_url_config(FunctionName=name)
         spec.triggers.append(Trigger(HTTP, {"method": "ANY", "path": None, "event_format": "2.0", "source": "function-url"}))
@@ -87,20 +87,41 @@ def _download_zip(url: str, dest: Path) -> None:
         zf.extractall(root)
 
 
-def _event_source_mappings(lam: Any, name: str) -> list[Trigger]:
+def _event_source_mappings(lam: Any, name: str, warnings: list[str]) -> list[Trigger]:
     out = []
     for page in lam.get_paginator("list_event_source_mappings").paginate(FunctionName=name):
         for m in page["EventSourceMappings"]:
             src = m.get("EventSourceArn", "")
+            common = {"esm_uuid": m.get("UUID"), "enabled": m.get("State") == "Enabled", "filter_criteria": m.get("FilterCriteria"),
+                      "report_batch_item_failures": "ReportBatchItemFailures" in (m.get("FunctionResponseTypes") or [])}
+            if m.get("FilterCriteria"):
+                warnings.append(f"event source mapping {m.get('UUID')}: FilterCriteria is not applied on EKS, so the handler sees every record")
             if ":sqs:" in src:
                 parts = src.split(":")
                 out.append(Trigger(SQS, {
                     "queue_arn": src,
                     "queue_url": f"https://sqs.{parts[3]}.amazonaws.com/{parts[4]}/{parts[5]}",
-                    "batch_size": m.get("BatchSize", 10),
-                    "report_batch_item_failures": "ReportBatchItemFailures" in (m.get("FunctionResponseTypes") or []),
-                    "enabled": m.get("State") == "Enabled",
+                    "batch_size": m.get("BatchSize", 10), **common,
                 }))
+            elif ":kinesis:" in src or ":dynamodb:" in src:
+                kind = KINESIS if ":kinesis:" in src else DYNAMODB
+                details = {
+                    "stream_arn": src, "starting_position": m.get("StartingPosition", "LATEST"),
+                    "starting_timestamp": str(m["StartingPositionTimestamp"]) if m.get("StartingPositionTimestamp") else None,
+                    "batch_size": m.get("BatchSize", 100), "max_retry_attempts": m.get("MaximumRetryAttempts", -1),
+                    "bisect_on_error": bool(m.get("BisectBatchOnFunctionError")),
+                    "parallelization_factor": m.get("ParallelizationFactor", 1),
+                    "detail": f"event source mapping {m.get('UUID')} from {src}", **common,
+                }
+                if kind == KINESIS:
+                    details["stream_name"] = src.split("/", 1)[1]
+                else:
+                    details["table_name"] = src.split(":table/", 1)[1].split("/")[0]
+                if details["parallelization_factor"] > 1:
+                    warnings.append(f"{src}: ParallelizationFactor {details['parallelization_factor']} is not reproduced; one batch per shard at a time")
+                if (m.get("DestinationConfig") or {}).get("OnFailure", {}).get("Destination"):
+                    warnings.append(f"{src}: the on-failure destination is not reproduced; records that exhaust their retries are logged and skipped")
+                out.append(Trigger(kind, details))
             else:
                 kind = src.split(":")[2] if src.count(":") >= 2 else "unknown"
                 out.append(Trigger(UNSUPPORTED, {"source": kind, "detail": f"event source mapping from {src or m.get('SelfManagedEventSource')}"}))
@@ -121,6 +142,10 @@ def _policy_triggers(clients: dict[str, Any], name: str, fn_arn: str, warnings: 
             out.extend(_apigw_trigger(clients["apigatewayv2"], source_arn, fn_arn, warnings))
         elif principal == "events.amazonaws.com":
             out.extend(_events_trigger(clients["events"], source_arn, fn_arn, warnings))
+        elif principal == "s3.amazonaws.com" and source_arn.startswith("arn:aws:s3:::"):
+            out.append(_s3_trigger(clients["s3"], source_arn.split(":::", 1)[1], fn_arn, warnings))
+        elif principal == "sns.amazonaws.com" and source_arn.startswith("arn:aws:sns:"):
+            out.append(_sns_trigger(clients["sns"], source_arn, fn_arn, warnings))
         elif principal:
             out.append(Trigger(UNSUPPORTED, {"source": principal.split(".")[0], "detail": f"{principal} via {source_arn or 'any source'}"}))
     return out
@@ -173,3 +198,33 @@ def _events_trigger(events: Any, source_arn: str, fn_arn: str, warnings: list[st
             payload = t.get("Input")
     return [Trigger(SCHEDULE, {"expression": rule["ScheduleExpression"], "input": payload,
                                "rule_arn": rule.get("Arn"), "suspended": rule.get("State") == "DISABLED"})]
+
+
+def _s3_trigger(s3: Any, bucket: str, fn_arn: str, warnings: list[str]) -> Trigger:
+    events: list[str] = []
+    rules: list[dict[str, str]] = []
+    try:
+        cfg = s3.get_bucket_notification_configuration(Bucket=bucket)
+        for c in cfg.get("LambdaFunctionConfigurations") or []:
+            if c.get("LambdaFunctionArn", "").split(":function:")[-1].split(":")[0] == fn_arn.split(":function:")[-1]:
+                events += c.get("Events") or []
+                rules += ((c.get("Filter") or {}).get("Key") or {}).get("FilterRules") or []
+    except Exception as e:  # noqa: BLE001 - permissions vary
+        warnings.append(f"could not read the notification configuration of bucket {bucket} ({e.__class__.__name__}); "
+                        "events default to s3:ObjectCreated:*")
+    return Trigger(S3, {"bucket": bucket, "events": events or ["s3:ObjectCreated:*"], "filter_rules": rules,
+                        "detail": f"S3 bucket {bucket} notification"})
+
+
+def _sns_trigger(sns: Any, topic_arn: str, fn_arn: str, warnings: list[str]) -> Trigger:
+    details: dict[str, Any] = {"topic_arn": topic_arn, "detail": f"SNS topic {topic_arn}"}
+    try:
+        for page in sns.get_paginator("list_subscriptions_by_topic").paginate(TopicArn=topic_arn):
+            for sub in page["Subscriptions"]:
+                if sub.get("Protocol") == "lambda" and sub.get("Endpoint", "").startswith(fn_arn):
+                    attrs = sns.get_subscription_attributes(SubscriptionArn=sub["SubscriptionArn"])["Attributes"]
+                    details.update(subscription_arn=sub["SubscriptionArn"], filter_policy=attrs.get("FilterPolicy"),
+                                   filter_policy_scope=attrs.get("FilterPolicyScope"))
+    except Exception as e:  # noqa: BLE001 - permissions vary
+        warnings.append(f"could not read the subscriptions of {topic_arn} ({e.__class__.__name__}); copy any filter policy by hand")
+    return Trigger(SNS, details)

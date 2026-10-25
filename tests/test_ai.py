@@ -174,3 +174,100 @@ def test_schema_is_strict():
             for v in node:
                 walk(v)
     walk(schema)
+
+
+@pytest.mark.parametrize("value, secret", [
+    ("https://hooks.example.com/services/T0ABCD123/B0ABCD123/a8Fk2LqP9zXc4VbN7mRt1YwE", "a8Fk2LqP9zXc4VbN7mRt1YwE"),
+    ("https://b.s3.amazonaws.com/f?X-Amz-Signature=8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c", "8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c"),
+])
+def test_capability_urls_are_redacted(value, secret):
+    out = ai.redact_env_value("TARGET_URL", value)
+    assert secret not in out and out.startswith("https://")
+
+
+# ------------------------------------------------------------------ Together AI
+
+def together_reply(content, finish="stop"):
+    return {"model": "zai-org/GLM-5.3", "choices": [{"message": {"content": content}, "finish_reason": finish}]}
+
+
+def test_together_request_shape(sample_specs):
+    plan = baseline_plan(sample_specs["orders-api"], "r")
+    sent = []
+    fenced = "Here is the review:\n```json\n" + json.dumps(answer(concurrency=3)) + "\n```"
+    result = ai.review(plan, provider="together", client=lambda body: sent.append(body) or together_reply(fenced))
+    assert result["settings"]["concurrency"]["value"] == 3 and plan.ai_model == "together:zai-org/GLM-5.3"
+    [body] = sent
+    assert body["model"] == ai.DEFAULT_MODELS["together"]
+    assert body["response_format"]["type"] == "json_schema" and body["response_format"]["json_schema"]["strict"] is True
+    assert body["messages"][0] == {"role": "system", "content": ai.SYSTEM_PROMPT}
+    assert '<file path="app.py">' in body["messages"][1]["content"] and "sk_test_do_not_ship" not in body["messages"][1]["content"]
+
+
+def http_error(code):
+    import io
+    import urllib.error
+    return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(b'{"error": "nope"}'))
+
+
+@pytest.mark.parametrize("reply, err", [
+    (together_reply("{", "length"), "output limit"),
+    (together_reply(""), "no answer"),
+    (together_reply("I cannot help with that."), "not valid JSON"),
+    (together_reply(json.dumps({"summary": "x"})), "does not match the schema"),
+    (together_reply(json.dumps({**answer(), "findings": [{"severity": "urgent", "title": "t"}]})), "findings\\[0\\]"),
+    (http_error(401), "credentials rejected"),
+    (http_error(429), "rate limited"),
+    (http_error(500), "Together API error 500"),
+])
+def test_together_failures_are_loud(sample_specs, reply, err):
+    plan = baseline_plan(sample_specs["orders-api"], "r")
+
+    def post(body):
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    with pytest.raises(ai.AIReviewError, match=err):
+        ai.review(plan, provider="together", client=post)
+
+
+def test_resolve_provider(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("TOGETHER_API_KEY", raising=False)
+    with pytest.raises(ai.AIReviewError, match="no AI credentials"):
+        ai.resolve_provider("auto")
+    monkeypatch.setenv("TOGETHER_API_KEY", "t")
+    assert ai.resolve_provider("auto") == "together"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    assert ai.resolve_provider("auto") == "anthropic" and ai.resolve_provider("together") == "together"
+
+
+def test_missing_trigger_advice_fields_are_dropped(sample_specs):
+    plan = baseline_plan(sample_specs["orders-api"], "r")
+    ai.apply_review(plan, answer(trigger_advice=[{"trigger": "kafka"}, "text", {"trigger": "mq", "recommendation": "keep on Lambda"}]))
+    assert plan.trigger_advice == [{"trigger": "mq", "recommendation": "keep on Lambda"}]
+
+
+def test_settings_without_a_workload_are_hidden_and_ignored(sample_specs):
+    plan = baseline_plan(sample_specs["order-worker"], "r")
+    msg = ai.build_user_message(plan, [], [])
+    rule_plan = json.loads(msg.split("<rule_plan>")[1].split("</rule_plan>")[0])
+    assert "http_min_replicas" not in rule_plan["settings"] and "sqs_max_replicas" in rule_plan["settings"]
+    assert {"http_min_replicas", "ingress_scheme", "stream_max_replicas"} <= set(rule_plan["settings_not_used"])
+    ai.apply_review(plan, answer(http_min_replicas=0, ingress_scheme="internet-facing", sqs_max_replicas=7))
+    assert plan.decisions["http_min_replicas"].source == "rule" and plan.ingress_scheme == "internal"
+    assert plan.sqs_max_replicas == 7
+
+
+def test_findings_citing_unknown_files_are_flagged(sample_specs):
+    plan = baseline_plan(sample_specs["orders-api"], "r")
+    result = answer(findings=[
+        {"severity": "blocker", "title": "made up", "detail": "", "file": "index.ts", "line": 9},
+        {"severity": "high", "title": "real", "detail": "", "file": "app.py", "line": 3},
+        {"severity": "low", "title": "config", "detail": "", "file": "function config", "line": None}])
+    client, _ = fake_client(message(json.dumps(result)))
+    out = ai.review(plan, client=client)
+    titles = [f["title"] for f in out["findings"]]
+    assert titles[0].startswith("[UNVERIFIED") and titles[1:] == ["real", "config"]
+    assert any("index.ts" in n for n in plan.ai_notes)
