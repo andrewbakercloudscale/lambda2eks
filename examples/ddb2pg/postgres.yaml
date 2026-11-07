@@ -1,0 +1,41 @@
+# PostgreSQL for the ddb2pg end-to-end run. Throwaway: no volume, test password.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ddb2pg
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: ddb2pg
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.6
+          env:
+            - {name: POSTGRES_PASSWORD, value: ddb2pg}
+            - {name: POSTGRES_DB, value: app}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [pg_isready, -U, postgres]}
+            periodSeconds: 2
+          resources:
+            requests: {memory: 128Mi, cpu: 100m}
+            limits: {memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ddb2pg
+spec:
+  type: LoadBalancer
+  selector: {app: postgres}
+  ports:
+    - {name: pg, port: 15432, targetPort: 5432}

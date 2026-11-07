@@ -45,8 +45,16 @@ def test_ddl_has_primary_key_index_views_and_checkpoints():
     sql = ddl(schema())
     assert 'CREATE TABLE IF NOT EXISTS "orders_table"' in sql and 'PRIMARY KEY ("pk", "sk")' in sql
     assert 'ON "orders_table" ("gsi1_pk", "created_at");  -- GSI GSI1' in sql
-    assert "CREATE OR REPLACE VIEW \"orders_table_user\" AS SELECT * FROM \"orders_table\" WHERE \"pk\" LIKE 'USER#%';" in sql
+    assert ("CREATE OR REPLACE VIEW \"orders_table_user\" AS SELECT * FROM \"orders_table\" "
+            "WHERE \"pk\" = 'USER' OR \"pk\" LIKE 'USER#%';") in sql
     assert "ddb2pg_checkpoints" in sql and "doc jsonb NOT NULL" in sql
+
+
+def test_entities_from_the_sort_key_when_the_partition_key_has_one_prefix():
+    items = [{"PK": {"S": f"USER#{i}"}, "SK": {"S": "PROFILE" if i % 3 == 0 else f"ORDER#{i}"}} for i in range(9)]
+    s = infer_schema(DESC, items)
+    assert s.entity_key == "SK" and s.entities == {"ORDER": 6, "PROFILE": 3}
+    assert "WHERE \"sk\" = 'PROFILE' OR \"sk\" LIKE 'PROFILE#%';" in ddl(s)
 
 
 def test_doc_is_lossless_json():

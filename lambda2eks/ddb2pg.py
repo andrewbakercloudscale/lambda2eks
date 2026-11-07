@@ -36,6 +36,7 @@ from typing import Any
 PG_TYPES = {"S": "text", "N": "numeric", "B": "bytea", "BOOL": "boolean", "M": "jsonb", "L": "jsonb",
             "SS": "text[]", "NS": "numeric[]", "BS": "bytea[]"}
 ENTITY_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9_]*)#")
+ENTITY_WORD = re.compile(r"^([A-Z][A-Z0-9_]*)$")  # a whole sort key like PROFILE or META
 SYSTEM_COLUMNS = ("doc", "_synced_at")
 
 
@@ -118,6 +119,7 @@ class Schema:
     ttl_attribute: str | None = None
     stream_view: str | None = None   # NEW_IMAGE, NEW_AND_OLD_IMAGES, KEYS_ONLY, OLD_IMAGE or None
     entities: dict[str, int] = field(default_factory=dict)  # single-table design: key prefix -> sampled count
+    entity_key: str | None = None    # the key attribute the entity prefixes come from (partition key if None)
     sampled: int = 0
     item_count_estimate: int = 0
     notes: list[str] = field(default_factory=list)
@@ -189,16 +191,22 @@ def infer_schema(desc: dict[str, Any], items: list[dict[str, Any]], ttl_attribut
             indexes.append({"name": ix["IndexName"], "kind": kind, "attributes": attrs,
                             "projection": ix.get("Projection", {}).get("ProjectionType", "ALL")})
 
-    entities = Counter()
-    for item in items:
-        v = item.get(pk, {}).get("S")
-        m = ENTITY_PREFIX.match(v or "")
-        if m:
-            entities[m.group(1)] += 1
-    if entities and sum(entities.values()) >= 0.8 * len(items) and len(entities) > 1:
-        notes.append(f"single-table design: {len(entities)} entity prefixes in {pk}; a view is created per entity")
-    else:
-        entities = Counter()
+    # Single-table design: entity types show as key prefixes (USER#1, ORDER#9). Users and their orders
+    # often share a partition (PK=USER#1, SK=PROFILE / ORDER#0001), so the sort key is tried too.
+    entities, entity_key = Counter(), None
+    for key, patterns in ((pk, (ENTITY_PREFIX,)), (sk, (ENTITY_PREFIX, ENTITY_WORD))):
+        if not key:
+            continue
+        found = Counter()
+        for item in items:
+            v = item.get(key, {}).get("S") or ""
+            m = next((m for p in patterns if (m := p.match(v))), None)
+            if m:
+                found[m.group(1)] += 1
+        if len(found) > 1 and sum(found.values()) >= 0.8 * len(items):
+            entities, entity_key = found, key
+            notes.append(f"single-table design: {len(found)} entity prefixes in {key}; a view is created per entity")
+            break
     stream = desc.get("StreamSpecification") or {}
     view = stream.get("StreamViewType") if stream.get("StreamEnabled") else None
     if not view:
@@ -214,7 +222,7 @@ def infer_schema(desc: dict[str, Any], items: list[dict[str, Any]], ttl_attribut
         notes.append("some indexes project only some attributes; PostgreSQL indexes always reach the whole row")
     return Schema(table=desc["TableName"], pg_table=snake(desc["TableName"]), partition_key=pk, sort_key=sk,
                   columns=columns, indexes=indexes, ttl_attribute=ttl_attribute, stream_view=view,
-                  entities=dict(entities.most_common()), sampled=len(items),
+                  entities=dict(entities.most_common()), entity_key=entity_key, sampled=len(items),
                   item_count_estimate=desc.get("ItemCount", 0), notes=notes)
 
 
@@ -233,10 +241,11 @@ def ddl(schema: Schema) -> str:
     if schema.ttl_attribute and schema.column(schema.ttl_attribute):
         out.append(f"CREATE INDEX IF NOT EXISTS {ident(schema.pg_table + '_ttl')} ON {t} "
                    f"({ident(schema.column(schema.ttl_attribute).name)});  -- TTL sweeps")
-    pkcol = ident(schema.column(schema.partition_key).name)
+    ecol = ident(schema.column(schema.entity_key or schema.partition_key).name)
     for entity in schema.entities:
+        lit = entity.replace("'", "''")
         out.append(f"CREATE OR REPLACE VIEW {ident(schema.pg_table + '_' + snake(entity))} AS "
-                   f"SELECT * FROM {t} WHERE {pkcol} LIKE '{entity.replace(chr(39), chr(39) * 2)}#%';")
+                   f"SELECT * FROM {t} WHERE {ecol} = '{lit}' OR {ecol} LIKE '{lit}#%';")
     out.append("CREATE TABLE IF NOT EXISTS ddb2pg_checkpoints (pg_table text NOT NULL, shard_id text NOT NULL, "
                "sequence_number text, finished boolean NOT NULL DEFAULT false, updated_at timestamptz NOT NULL DEFAULT now(), "
                "PRIMARY KEY (pg_table, shard_id));")
