@@ -50,6 +50,18 @@ def test_node_image_resolves_the_runtime_sdk(sample_specs):
     assert "NODE_PATH" not in dockerfile(python, src_present=True)
 
 
+def test_deployed_package_is_not_reinstalled(sample_specs, tmp_path):
+    # from-aws downloads the package Lambda ran, node_modules included. Reinstalling would re-resolve
+    # the lockfile (often against a registry the image cannot reach) and could change versions.
+    import dataclasses
+    (tmp_path / "package.json").write_text("{}")
+    (tmp_path / "package-lock.json").write_text("{}")
+    spec = dataclasses.replace(sample_specs["order-worker"], code_dir=tmp_path)
+    assert "npm ci" in dockerfile(baseline_plan(spec, "r"), src_present=True)
+    built = dataclasses.replace(spec, prebuilt=True)
+    assert "npm" not in dockerfile(baseline_plan(built, "r"), src_present=True)
+
+
 def test_secret_values_never_written(sample_specs):
     files = manifests(baseline_plan(sample_specs["orders-api"], "r"), "ns", "eu-west-1", "pod-identity")
     assert files["secret.yaml"][0]["stringData"] == {"STRIPE_API_KEY": "REPLACE_ME"}

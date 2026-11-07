@@ -49,6 +49,8 @@ class FunctionSpec:
     region: str | None = None
     account_id: str | None = None
     code_dir: Path | None = None
+    # The code is the package Lambda ran (from-aws), dependencies included: build it as is, no reinstall.
+    prebuilt: bool = False
     image_uri: str | None = None
     architectures: list[str] = field(default_factory=lambda: ["x86_64"])
     layers: list[str] = field(default_factory=list)

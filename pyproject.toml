@@ -28,3 +28,6 @@ include = ["lambda2eks*"]
 
 [tool.setuptools.package-data]
 lambda2eks = ["shims/*", "templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

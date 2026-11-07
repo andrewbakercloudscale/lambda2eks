@@ -56,11 +56,11 @@ def dockerfile(plan: Plan, src_present: bool) -> str:
         lines.append(f"FROM {spec.image_uri}")
     elif family == "python":
         lines += [f"FROM public.ecr.aws/lambda/python:{runtime_tag(spec.runtime)}", "COPY src/ ${LAMBDA_TASK_ROOT}/"]
-        if src_present and (spec.code_dir / "requirements.txt").is_file():
+        if src_present and not spec.prebuilt and (spec.code_dir / "requirements.txt").is_file():
             lines.append("RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt -t ${LAMBDA_TASK_ROOT}")
     else:
         lines += [f"FROM public.ecr.aws/lambda/nodejs:{runtime_tag(spec.runtime)}", "COPY src/ ${LAMBDA_TASK_ROOT}/"]
-        if src_present and (spec.code_dir / "package.json").is_file():
+        if src_present and not spec.prebuilt and (spec.code_dir / "package.json").is_file():
             lock = (spec.code_dir / "package-lock.json").is_file()
             lines.append("RUN cd ${LAMBDA_TASK_ROOT} && " + ("npm ci --omit=dev" if lock else "npm install --omit=dev"))
     if family == "python":
@@ -162,8 +162,8 @@ def _pod_spec(plan: Plan, workload: Workload, mode_env: list[dict[str, str]], re
         "env": _base_env(plan, workload_mode(workload), region) + mode_env,
         **({"envFrom": env_from} if env_from else {}),
         "resources": {
-            "requests": {"cpu": f"{plan.cpu_millicores}m", "memory": f"{plan.memory_mb}Mi"},
-            "limits": {"memory": f"{plan.memory_mb}Mi"},
+            "requests": {"cpu": f"{plan.cpu_millicores}m", "memory": f"{pod_memory_mb(plan, workload)}Mi"},
+            "limits": {"memory": f"{pod_memory_mb(plan, workload)}Mi"},
         },
         "securityContext": {
             "runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000, "readOnlyRootFilesystem": True,
@@ -186,6 +186,16 @@ def _pod_spec(plan: Plan, workload: Workload, mode_env: list[dict[str, str]], re
     if restart:
         pod["restartPolicy"] = restart
     return pod
+
+
+# On Lambda the queue and stream pollers run outside the function's sandbox, so its memory setting
+# covers the handler only. Here the shim polls inside the same container: SDK clients, lease
+# bookkeeping and an in-flight batch. A 128 MB stream consumer was OOM-killed without this.
+POLLER_OVERHEAD_MB = {"sqs": 64, "stream": 96}
+
+
+def pod_memory_mb(plan: Plan, workload: Workload) -> int:
+    return plan.memory_mb + POLLER_OVERHEAD_MB.get(workload_mode(workload), 0)
 
 
 def workload_mode(w: Workload) -> str:

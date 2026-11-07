@@ -104,6 +104,33 @@ Layers, extensions, VPC config, FilterCriteria on event source mappings, Paralle
 
 `examples/test-lambdas/` has ten test Lambdas, one for each trigger. `rancher/run.py all` migrates them onto Rancher Desktop's Kubernetes, with LocalStack standing in for the AWS account and KEDA installed. It then sends real events through every trigger and checks the results. See [its README](examples/test-lambdas/README.md).
 
+AWS's own samples on a real account: `examples/aws-samples/run.py all` deploys nine of them, checks
+them on Lambda, migrates them with `from-aws --live` and checks them again on Rancher Desktop with the
+real queues, streams and buckets. 9/9 pass; [findings](examples/aws-samples/README.md).
+
+## DynamoDB to PostgreSQL
+
+`lambda2eks ddb2pg` moves a table to any PostgreSQL (`pip install 'lambda2eks[postgres]'`):
+
+```bash
+lambda2eks ddb2pg plan Orders --out ddb2pg                       # infer columns, indexes, entity views
+lambda2eks ddb2pg apply    --database-url $PG --schema ddb2pg/orders.schema.json
+lambda2eks ddb2pg backfill --database-url $PG --schema ddb2pg/orders.schema.json   # parallel Scan
+lambda2eks ddb2pg sync     --database-url $PG --schema ddb2pg/orders.schema.json   # stream, until cut-over
+lambda2eks ddb2pg verify   --database-url $PG --schema ddb2pg/orders.schema.json   # counts + sampled items
+lambda2eks ddb2pg rewrite  ./src --schema ddb2pg/orders.schema.json                # AI patches, DynamoDB calls -> SQL
+```
+
+- Every item is kept whole in `doc jsonb`; keys, index attributes and consistently typed attributes
+  also get typed columns. An attribute with mixed types stays in `doc` only, and is reported.
+- Single-table designs get a view per entity prefix (`USER#`, `ORDER#`), from the partition or sort key.
+- `sync` reads the stream from TRIM_HORIZON or its checkpoint (kept in PostgreSQL), parents before
+  children; KEYS_ONLY and OLD_IMAGE streams are read back with a consistent GetItem.
+- TTL becomes a note: schedule the `DELETE` yourself (pg_cron or a CronJob).
+
+`examples/ddb2pg/run.py` runs it end to end on Rancher Desktop (LocalStack + PostgreSQL 17): seed,
+plan, apply, backfill, change the table, sync, verify. 8/8 checks pass; Rancher is shut down after.
+
 ## Tests
 
 ```bash

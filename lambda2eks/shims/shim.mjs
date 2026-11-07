@@ -665,6 +665,7 @@ export class StreamConsumer {
       const lease = snap[id] || {};
       if (this.workers.has(id) || (lease.owner && lease.owner !== this.leases.owner && lease.expires > now)) continue;
       if (await this.leases.acquire(id, now)) {
+        log('INFO', `holding shard ${id} from ${lease.checkpoint || this.position}`);
         const w = { stop: { stopped: false }, done: false };
         w.promise = this.runWorker(id, lease.checkpoint || null, w.stop).finally(() => { w.done = true; });
         this.workers.set(id, w);

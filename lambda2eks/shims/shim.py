@@ -684,6 +684,7 @@ class StreamConsumer:
             if shard_id in self.workers or (lease.get("owner") and lease["owner"] != self.leases.owner and lease["expires"] > now):
                 continue
             if self.leases.acquire(shard_id, now):
+                log.info("holding shard %s from %s", shard_id, lease.get("checkpoint") or self.position)
                 stop = threading.Event()
                 thread = threading.Thread(target=self._run_worker, args=(shard_id, lease.get("checkpoint") or None, stop), daemon=True)
                 self.workers[shard_id] = (thread, stop)

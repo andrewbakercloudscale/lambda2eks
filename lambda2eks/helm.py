@@ -53,7 +53,7 @@ def chart(plan: Plan, files: dict[str, list[dict[str, Any]]], iam_mode: str) -> 
     values: dict[str, Any] = {
         "image": {"repository": image_repo, "tag": image_tag},
         "roleArn": plan.spec.role_arn or "REPLACE_ME",
-        "resources": {"cpu": f"{plan.cpu_millicores}m", "memory": f"{plan.memory_mb}Mi"},
+        "resources": {"cpu": f"{plan.cpu_millicores}m"},
         "concurrency": plan.concurrency,
         "workloads": {},
     }
@@ -103,8 +103,10 @@ def chart(plan: Plan, files: dict[str, list[dict[str, Any]]], iam_mode: str) -> 
             if pod and wkind in (HTTP, INVOKE, SQS, SCHEDULE, *BRIDGED, *STREAMS):
                 for c in pod["containers"]:
                     c["image"] = tok.value('printf "%s:%s" .Values.image.repository .Values.image.tag')
-                    c["resources"] = {"requests": {"cpu": tok.value(".Values.resources.cpu"), "memory": tok.value(".Values.resources.memory")},
-                                      "limits": {"memory": tok.value(".Values.resources.memory")}}
+                    # Memory is per workload: queue and stream pods carry the shim's poller on top of the function.
+                    values["workloads"].setdefault(name, {})["memory"] = c["resources"]["limits"]["memory"]
+                    c["resources"] = {"requests": {"cpu": tok.value(".Values.resources.cpu"), "memory": tok.value(f"{_wl(name)}.memory")},
+                                      "limits": {"memory": tok.value(f"{_wl(name)}.memory")}}
                     for e in c["env"]:
                         if e["name"] == "L2E_CONCURRENCY":
                             e["value"] = tok.value(".Values.concurrency | quote")
