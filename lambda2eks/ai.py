@@ -280,7 +280,9 @@ def _flag_unknown_files(plan: Plan, result: dict[str, Any], sent: list[str]) -> 
             plan.ai_notes.append(f"the AI review cites `{f}`, which is not in the source it was sent; check that {kind} by hand")
 
 
-def _call_anthropic(plan: Plan, model: str, effort: str, user: str, client: Any) -> tuple[str, str]:
+def _call_anthropic(plan: Plan | None, model: str, effort: str, user: str, client: Any,
+                    system: str = SYSTEM_PROMPT, schema: dict[str, Any] | None = None, label: str | None = None) -> tuple[str, str]:
+    label = label or f"the review of {plan.spec.name}"
     import anthropic
 
     client = client or anthropic.Anthropic()
@@ -290,8 +292,8 @@ def _call_anthropic(plan: Plan, model: str, effort: str, user: str, client: Any)
             max_tokens=64000,
             betas=[FALLBACK_BETA],
             fallbacks="default",
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-            output_config={"effort": effort, "format": {"type": "json_schema", "schema": response_schema()}},
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema or response_schema()}},
             messages=[{"role": "user", "content": user}],
         ) as stream:
             message = stream.get_final_message()
@@ -305,16 +307,17 @@ def _call_anthropic(plan: Plan, model: str, effort: str, user: str, client: Any)
         raise AIReviewError(f"could not reach the Anthropic API: {e}") from e
 
     if message.stop_reason == "refusal":
-        raise AIReviewError(f"the model declined to review {plan.spec.name}")
+        raise AIReviewError(f"the model declined {label}")
     if message.stop_reason == "max_tokens":
-        raise AIReviewError(f"the review of {plan.spec.name} hit the output limit before finishing")
+        raise AIReviewError(f"{label} hit the output limit before finishing")
     text = next((b.text for b in message.content if b.type == "text"), None)
     if text is None:
-        raise AIReviewError(f"the review of {plan.spec.name} returned no answer (stop_reason={message.stop_reason})")
+        raise AIReviewError(f"{label} returned no answer (stop_reason={message.stop_reason})")
     return text, message.model
 
 
-def _call_together(plan: Plan, model: str, user: str, post: Any = None) -> tuple[str, str]:
+def _call_together(plan: Plan | None, model: str, user: str, post: Any = None,
+                   system: str = SYSTEM_PROMPT, schema: dict[str, Any] | None = None, label: str | None = None) -> tuple[str, str]:
     """Together's OpenAI-compatible chat API with a strict JSON schema. `post` replaces the HTTP call in tests."""
     key = os.environ.get("TOGETHER_API_KEY")
     if not key and post is None:
@@ -322,8 +325,8 @@ def _call_together(plan: Plan, model: str, user: str, post: Any = None) -> tuple
     body = {
         "model": model,
         "max_tokens": 32000,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "lambda_review", "strict": True, "schema": response_schema()}},
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "response_format": {"type": "json_schema", "json_schema": {"name": "lambda_review", "strict": True, "schema": schema or response_schema()}},
     }
     if post is None:
         def post(payload: dict[str, Any]) -> dict[str, Any]:
@@ -344,14 +347,23 @@ def _call_together(plan: Plan, model: str, user: str, post: Any = None) -> tuple
         raise AIReviewError(f"Together API error {e.code}: {detail}") from e
     except (urllib.error.URLError, TimeoutError) as e:
         raise AIReviewError(f"could not reach the Together API: {e}") from e
+    label = label or f"the review of {plan.spec.name}"
     choice = (resp.get("choices") or [{}])[0]
     finish = choice.get("finish_reason")
     text = (choice.get("message") or {}).get("content")
     if finish == "length":
-        raise AIReviewError(f"the review of {plan.spec.name} hit the output limit before finishing")
+        raise AIReviewError(f"{label} hit the output limit before finishing")
     if not text:
-        raise AIReviewError(f"the review of {plan.spec.name} returned no answer (finish_reason={finish})")
+        raise AIReviewError(f"{label} returned no answer (finish_reason={finish})")
     return text, f"together:{resp.get('model') or model}"
+
+
+def complete_json(system: str, user: str, schema: dict[str, Any], model: str, effort: str = "high",
+                  provider: str = "anthropic", label: str = "the request", client: Any = None) -> str:
+    """One structured-output call outside the function review (used by ddb2pg rewrite). Returns the JSON text."""
+    if provider == "together":
+        return _call_together(None, model, user, client, system=system, schema=schema, label=label)[0]
+    return _call_anthropic(None, model, effort, user, client, system=system, schema=schema, label=label)[0]
 
 
 def _json_text(text: str) -> str:

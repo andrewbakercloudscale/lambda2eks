@@ -29,6 +29,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     a.add_argument("functions", nargs="+", metavar="NAME")
     a.add_argument("--profile")
 
+    from . import ddb2pg
+    ddb2pg.add_parser(sub)
+
     for s in (t, a):
         s.add_argument("--out", type=Path, default=Path("out"), help="output directory (default: out)")
         s.add_argument("--region", help="AWS region for the workloads (default: the function's region)")
@@ -85,6 +88,8 @@ def review_one(plan: Plan, args: argparse.Namespace) -> tuple[dict | None, str |
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.source == "ddb2pg":
+        return args.func(args)
     specs = load(args)
     if not specs:
         print("no Lambda functions found", file=sys.stderr)
