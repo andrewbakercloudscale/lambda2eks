@@ -17,11 +17,11 @@ This folder has ten test Lambda functions, one for each trigger lambda2eks handl
 
 ## Run
 
-Rancher Desktop must have Kubernetes enabled, with the `rancher-desktop` context in kubectl and the moby (dockerd) engine, so images you build locally can be used without pushing them. The run was tested on k3s 1.35, with a VM of 4 CPUs and 8 GB.
+Rancher Desktop must have Kubernetes enabled, with the `rancher-desktop` context in kubectl and the moby (dockerd) engine, so images you build locally can be used without pushing them. `run.py` starts Rancher Desktop if it is not running, with a 6 GB, 4 CPU VM and Kubernetes on. `all` shuts it down when it finishes, even if a step fails (`--keep-running` leaves it up). After running single steps, finish with `run.py stop`. Tested on k3s 1.35.
 
 ```bash
 pip install -e '.[aws,test]'                     # from the repo root
-python examples/test-lambdas/rancher/run.py all  # up, seed, migrate, verify
+python examples/test-lambdas/rancher/run.py all  # start, up, seed, migrate, verify, shut down
 ```
 
 The steps, one at a time:

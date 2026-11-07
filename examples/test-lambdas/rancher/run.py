@@ -9,8 +9,12 @@ OVERLAY below): no ECR, no ALB controller, no Pod Identity.
     run.py seed      create the existing "AWS estate" in LocalStack: tables, queue, bucket, topic, stream
     run.py migrate   lambda2eks -> images -> bridge queues and lease tables -> S3/SNS cut-over -> kubectl apply
     run.py verify    send real events through every trigger and check what each function recorded
-    run.py all       up, seed, migrate, verify
+    run.py all       start Rancher Desktop, up, seed, migrate, verify, then shut Rancher Desktop down
     run.py down      delete the migrated workloads (--all also removes LocalStack and KEDA)
+    run.py stop      shut Rancher Desktop down
+
+Every step starts Rancher Desktop if it is not running. Only `all` shuts it down again (even when a
+step fails; --keep-running leaves it up), so after running single steps, finish with `run.py stop`.
 
 Run it with the repo's virtualenv: .venv/bin/python examples/test-lambdas/rancher/run.py all
 """
@@ -48,6 +52,8 @@ KEDA_CHART_VERSION = "2.21.0"
 ENDPOINT_IN_CLUSTER = "http://localstack.localstack.svc.cluster.local:4566"
 ENDPOINT_LOCAL = "http://localhost:4566"
 INGRESS = "http://127.0.0.1"
+# The VM Rancher Desktop starts with: the whole run (LocalStack, KEDA, ~15 pods) needs about 4 GB.
+RD_MEMORY_GB, RD_CPUS = 6, 4
 
 RESULTS_TABLE = "l2e-test-results"
 TODO_TABLE = "l2e-test-todos"
@@ -88,6 +94,29 @@ def wait_until(what: str, probe, timeout: float, every: float = 2.0):
         if time.time() > deadline:
             raise TimeoutError(f"timed out after {timeout:.0f}s waiting for {what}")
         time.sleep(every)
+
+
+# ------------------------------------------------------------------ Rancher Desktop
+
+def cluster_ready() -> bool:
+    try:
+        return kubectl("get", "--raw", "/readyz", capture=True, check=False, timeout=10).returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def start_rancher() -> None:
+    if cluster_ready():
+        return
+    log(f"starting Rancher Desktop ({RD_MEMORY_GB} GB, {RD_CPUS} CPUs, Kubernetes on)")
+    run("rdctl", "start", "--application.start-in-background", "--kubernetes.enabled",
+        f"--virtual-machine.memory-in-gb={RD_MEMORY_GB}", f"--virtual-machine.number-cpus={RD_CPUS}")
+    wait_until("the rancher-desktop cluster", cluster_ready, 600, 5)
+
+
+def stop_rancher(_: argparse.Namespace | None = None) -> None:
+    log("shutting Rancher Desktop down")
+    run("rdctl", "shutdown", check=False)
 
 
 # ------------------------------------------------------------------ up
@@ -526,11 +555,21 @@ def main() -> int:
         s.add_argument("--ai", action="store_true", help="run lambda2eks's AI review (needs ANTHROPIC_API_KEY or TOGETHER_API_KEY)")
     for s in (sub.choices["all"], sub.add_parser("verify")):
         s.add_argument("--only", action="append", metavar="FUNCTION", help="verify only this function; repeatable")
+    sub.choices["all"].add_argument("--keep-running", action="store_true", help="leave Rancher Desktop running afterwards")
     sub.add_parser("down").add_argument("--all", action="store_true", help="also remove LocalStack, KEDA and the namespace")
+    sub.add_parser("stop")
     args = p.parse_args()
+    if args.cmd == "stop":
+        stop_rancher()
+        return 0
+    start_rancher()
     if args.cmd == "all":
-        up(args), seed(args), migrate(args)
-        return verify(args)
+        try:
+            up(args), seed(args), migrate(args)
+            return verify(args)
+        finally:
+            if not args.keep_running:
+                stop_rancher()
     return {"up": up, "seed": seed, "migrate": migrate, "verify": verify, "down": down}[args.cmd](args) or 0
 
 
