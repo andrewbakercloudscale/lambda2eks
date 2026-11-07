@@ -1,0 +1,64 @@
+# What EKS + AWS would provide, on Rancher Desktop: LocalStack stands in for the AWS account,
+# and the namespace the migrated workloads go into. KEDA is installed by run.py with Helm.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: localstack
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localstack
+  namespace: localstack
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: localstack}
+  template:
+    metadata:
+      labels: {app: localstack}
+    spec:
+      containers:
+        - name: localstack
+          # 4.14.0 is the last LocalStack release that runs without an auth token.
+          image: localstack/localstack:4.14.0
+          env:
+            - {name: SERVICES, value: "sqs,sns,s3,dynamodb,dynamodbstreams,kinesis,cloudformation,sts,iam"}
+            - {name: EAGER_SERVICE_LOADING, value: "1"}
+            - {name: AWS_DEFAULT_REGION, value: us-east-1}
+          ports:
+            - containerPort: 4566
+          readinessProbe:
+            httpGet: {path: /_localstack/health, port: 4566}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 250m, memory: 768Mi}
+            limits: {memory: 2Gi}
+---
+# LoadBalancer: Rancher Desktop forwards it to localhost:4566, so run.py can seed and verify from the laptop.
+apiVersion: v1
+kind: Service
+metadata:
+  name: localstack
+  namespace: localstack
+spec:
+  type: LoadBalancer
+  selector: {app: localstack}
+  ports:
+    - {name: edge, port: 4566, targetPort: 4566}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lambda-migration
+---
+# KEDA's AWS scalers authenticate with these instead of EKS Pod Identity. LocalStack accepts any keys.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: localstack-credentials
+  namespace: lambda-migration
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test

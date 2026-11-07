@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Ten test Lambdas, one per trigger lambda2eks handles (and one it does not), for an end-to-end
+  migration onto a local cluster. Account 000000000000 and us-east-1 are LocalStack's defaults, so
+  every ARN below resolves against the LocalStack the rancher/ harness runs. Every function records
+  what it did in the l2e-test-results table, which is how rancher/run.py verify proves it ran.
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        RESULTS_TABLE: l2e-test-results
+        LOG_LEVEL: INFO
+
+Resources:
+  # HTTP API (payload 2.0), path parameters and a POST body.
+  GreeterApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: greeter-api
+      Runtime: python3.12
+      Handler: app.handler
+      CodeUri: functions/greeter_api/
+      Role: arn:aws:iam::000000000000:role/greeter-api-role
+      Events:
+        Greet:
+          Type: HttpApi
+          Properties: {Path: '/greet/{name}', Method: GET}
+        Sign:
+          Type: HttpApi
+          Properties: {Path: /greet, Method: POST}
+
+  # REST API (payload 1.0), Node, a DynamoDB-backed CRUD.
+  TodoRest:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: todo-rest
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: functions/todo_rest/
+      MemorySize: 256
+      Role: arn:aws:iam::000000000000:role/todo-rest-role
+      Environment:
+        Variables:
+          TODO_TABLE: l2e-test-todos
+      Events:
+        List:
+          Type: Api
+          Properties: {Path: /todos, Method: GET}
+        Create:
+          Type: Api
+          Properties: {Path: /todos, Method: POST}
+        Get:
+          Type: Api
+          Properties: {Path: '/todos/{id}', Method: GET}
+
+  # SQS with partial batch failures.
+  OrderProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: order-processor
+      Runtime: python3.12
+      Handler: handler.handler
+      CodeUri: functions/order_processor/
+      Timeout: 30
+      ReservedConcurrentExecutions: 3
+      Role: arn:aws:iam::000000000000:role/order-processor-role
+      Events:
+        Orders:
+          Type: SQS
+          Properties:
+            Queue: arn:aws:sqs:us-east-1:000000000000:l2e-test-orders
+            BatchSize: 5
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # S3 notification with a prefix filter -> bridge queue on EKS.
+  UploadIndexer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: upload-indexer
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: functions/upload_indexer/
+      Role: arn:aws:iam::000000000000:role/upload-indexer-role
+      Events:
+        Uploads:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - {Name: prefix, Value: incoming/}
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: l2e-test-uploads
+
+  # SNS with a filter policy -> bridge queue on EKS.
+  AlertRouter:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: alert-router
+      Runtime: python3.12
+      Handler: router.handler
+      CodeUri: functions/alert_router/
+      Role: arn:aws:iam::000000000000:role/alert-router-role
+      Events:
+        Alerts:
+          Type: SNS
+          Properties:
+            Topic: arn:aws:sns:us-east-1:000000000000:l2e-test-alerts
+            FilterPolicy:
+              severity: [high, critical]
+
+  # DynamoDB stream.
+  InventoryAudit:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: inventory-audit
+      Runtime: python3.12
+      Handler: audit.handler
+      CodeUri: functions/inventory_audit/
+      Role: arn:aws:iam::000000000000:role/inventory-audit-role
+      Events:
+        Changes:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt InventoryTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 25
+            MaximumRetryAttempts: 2
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: l2e-test-inventory
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: sku, AttributeType: S}]
+      KeySchema: [{AttributeName: sku, KeyType: HASH}]
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+
+  # Kinesis stream, Node.
+  ClickstreamCounter:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: clickstream-counter
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: functions/clickstream_counter/
+      Role: arn:aws:iam::000000000000:role/clickstream-counter-role
+      Events:
+        Clicks:
+          Type: Kinesis
+          Properties:
+            Stream: arn:aws:kinesis:us-east-1:000000000000:stream/l2e-test-clicks
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  # EventBridge schedule with a constant input.
+  NightlyCleanup:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: nightly-cleanup
+      Runtime: python3.12
+      Handler: cleanup.lambda_handler
+      CodeUri: functions/nightly_cleanup/
+      Timeout: 60
+      Role: arn:aws:iam::000000000000:role/nightly-cleanup-role
+      Events:
+        Nightly:
+          Type: Schedule
+          Properties:
+            Schedule: cron(15 3 * * ? *)
+            Input: '{"task": "expire-todos", "older_than_days": 30}'
+
+  # No trigger: called with the Invoke API by other services. Has a secret env var.
+  PriceCalculator:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: price-calculator
+      Runtime: nodejs20.x
+      Handler: index.handler
+      CodeUri: functions/price_calculator/
+      Role: arn:aws:iam::000000000000:role/price-calculator-role
+      Environment:
+        Variables:
+          PRICING_API_KEY: pk_test_local_only
+          TAX_RATE: '0.15'
+
+  # EventBridge event-pattern rule: lambda2eks reports it rather than migrating the trigger.
+  AuditShipper:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: audit-shipper
+      Runtime: python3.12
+      Handler: ship.handler
+      CodeUri: functions/audit_shipper/
+      Role: arn:aws:iam::000000000000:role/audit-shipper-role
+      Events:
+        Signins:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.signin]
+              detail-type: [AWS Console Sign In via CloudTrail]

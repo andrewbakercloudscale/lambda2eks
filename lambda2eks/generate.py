@@ -71,7 +71,13 @@ def dockerfile(plan: Plan, src_present: bool) -> str:
             'ENTRYPOINT ["python3", "/opt/lambda2eks/shim.py"]',
         ]
     else:
+        # Lambda's bootstrap script sets NODE_PATH, and the Lambda build of Node honours it for ES modules too.
+        # The shim replaces that script, so without this `import ... from '@aws-sdk/...'` (and layers) fail.
+        major = runtime_tag(spec.runtime) if spec.runtime and spec.runtime.startswith("nodejs") else None
+        node_path = ([f"/opt/nodejs/node{major}/node_modules"] if major else []) + \
+                    ["/opt/nodejs/node_modules", "/var/runtime/node_modules", "/var/runtime", "/var/task"]
         lines += [
+            f"ENV NODE_PATH={':'.join(node_path)}",
             "COPY lambda2eks-shim.mjs /opt/lambda2eks/shim.mjs",
             "USER 1000:1000",
             'ENTRYPOINT ["node", "/opt/lambda2eks/shim.mjs"]',
@@ -134,6 +140,11 @@ def _base_env(plan: Plan, mode: str, region: str) -> list[dict[str, str]]:
     }
     if spec.account_id:
         env["L2E_ACCOUNT_ID"] = spec.account_id
+    if spec.runtime_family == "node" and "NODE_OPTIONS" not in spec.environment:
+        # The heap sizing Lambda's bootstrap applies, from the pod's memory limit: V8 collects garbage
+        # before the container reaches its limit instead of being OOM-killed.
+        new_space = plan.memory_mb // 10
+        env["NODE_OPTIONS"] = f"--max-semi-space-size={new_space // 6} --max-old-space-size={plan.memory_mb - new_space}"
     return [{"name": k, "value": v} for k, v in env.items()]
 
 

@@ -3,7 +3,7 @@ import json
 import yaml
 
 from lambda2eks import ai, cli
-from lambda2eks.generate import manifests, trust_policy
+from lambda2eks.generate import dockerfile, manifests, trust_policy
 from lambda2eks.plan import baseline_plan
 
 from .conftest import SAMPLE
@@ -35,6 +35,19 @@ def test_manifests_per_trigger(sample_specs):
     cron = manifests(baseline_plan(sample_specs["nightly-report"], "r"), "ns", "eu-west-1", "pod-identity")["nightly-report-cron.yaml"][0]
     assert cron["spec"]["schedule"] == "30 2 * * MON-FRI" and cron["spec"]["timeZone"] == "Etc/UTC"
     assert cron["spec"]["jobTemplate"]["spec"]["backoffLimit"] == 2
+
+
+def test_node_image_resolves_the_runtime_sdk(sample_specs):
+    # Lambda's bootstrap sets NODE_PATH (Lambda's Node honours it for ES modules) and sizes the heap.
+    # The shim replaces the bootstrap, so the image and pod must do both, or `import '@aws-sdk/...'` fails.
+    plan = baseline_plan(sample_specs["order-worker"], "r")
+    assert ("ENV NODE_PATH=/opt/nodejs/node20/node_modules:/opt/nodejs/node_modules:"
+            "/var/runtime/node_modules:/var/runtime:/var/task") in dockerfile(plan, src_present=True)
+    deploy = by_kind(manifests(plan, "ns", "eu-west-1", "pod-identity")["order-worker-sqs-orders.yaml"])["Deployment"]
+    env = {e["name"]: e["value"] for e in deploy["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["NODE_OPTIONS"] == "--max-semi-space-size=17 --max-old-space-size=922"  # 1024 MB, as Lambda computes it
+    python = baseline_plan(sample_specs["orders-api"], "r")
+    assert "NODE_PATH" not in dockerfile(python, src_present=True)
 
 
 def test_secret_values_never_written(sample_specs):

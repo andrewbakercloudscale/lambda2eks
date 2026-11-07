@@ -100,6 +100,10 @@ Applying the output moves no events: queue and stream workers start paused (KEDA
 
 Layers, extensions, VPC config, FilterCriteria on event source mappings, ParallelizationFactor > 1, tumbling windows, provisioned concurrency, destinations, async DLQs, and API Gateway authorizers, throttling and CORS. The report lists those that apply to each function.
 
+## End-to-end on a laptop
+
+`examples/test-lambdas/` has ten test Lambdas, one for each trigger. `rancher/run.py all` migrates them onto Rancher Desktop's Kubernetes, with LocalStack standing in for the AWS account and KEDA installed. It then sends real events through every trigger and checks the results. See [its README](examples/test-lambdas/README.md).
+
 ## Tests
 
 ```bash
