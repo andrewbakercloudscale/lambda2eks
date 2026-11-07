@@ -10,9 +10,10 @@ requires-python = ">=3.10"
 license = "MIT"
 readme = "README.md"
 
+dependencies = ["pyyaml>=6", "anthropic>=2.3", "truststore>=0.10"]
+
 [project.urls]
 Homepage = "https://github.com/andrewbakercloudscale/lambda2eks"
-dependencies = ["pyyaml>=6", "anthropic>=2.3", "truststore>=0.10"]
 
 [project.optional-dependencies]
 aws = ["boto3>=1.34"]
