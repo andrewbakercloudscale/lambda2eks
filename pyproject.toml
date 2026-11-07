@@ -7,6 +7,11 @@ name = "lambda2eks"
 version = "0.1.0"
 description = "Migrate AWS Lambda functions to EKS workloads, with Claude reviewing each function's code to make the migration decisions."
 requires-python = ">=3.10"
+license = "MIT"
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/andrewbakercloudscale/lambda2eks"
 dependencies = ["pyyaml>=6", "anthropic>=2.3", "truststore>=0.10"]
 
 [project.optional-dependencies]

@@ -111,3 +111,7 @@ pytest
 ```
 
 The shim tests run both shims for real, as HTTP servers, against payload formats 1.0 and 2.0. The stream consumer and bridge tests use fake AWS clients. The AI tests use fake Anthropic and Together clients. The manifests are validated with `kubeconform -strict` against the Kubernetes and KEDA CRD schemas (skipped if kubeconform is not installed; `brew install kubeconform`), the Helm chart is rendered with `helm template` and compared with the kustomize output, and the Route 53 script runs a full cycle against a fake `aws`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
