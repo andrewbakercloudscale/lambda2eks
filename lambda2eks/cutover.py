@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from importlib import resources
 
-from .generate import PAUSED, Target, _cfn_id
-from .model import DYNAMODB, HTTP, INVOKE, KINESIS, S3, SCHEDULE, SNS, SQS
+from .generate import PAUSED, Target, _cfn_id, sfn_rewrites
+from .model import DYNAMODB, HTTP, INVOKE, KINESIS, S3, SCHEDULE, SFN, SNS, SQS
 from .plan import Plan, Workload
 
 
@@ -160,7 +160,32 @@ def _stream(plan: Plan, w: Workload, t: Target) -> list[str]:
             *_sh(_pause(ns, w), "aws lambda update-event-source-mapping --uuid \"$UUID\" --enabled")]
 
 
+def _scheduler(plan: Plan, w: Workload, t: Target) -> list[str]:
+    ns, d = t.namespace, w.trigger.details
+    name, group = d.get("schedule_name") or "REPLACE_ME_SCHEDULE", d.get("group_name") or "default"
+    state = f"cutover/.state/schedule-{group}-{name}.json"
+    # update-schedule replaces the whole schedule, so the change is made on a copy of what get-schedule returned.
+    keep = ("Name, GroupName, ScheduleExpression, ScheduleExpressionTimezone, FlexibleTimeWindow, Target, StartDate, "
+            "EndDate, Description, KmsKeyArn, ActionAfterCompletion")
+
+    def set_state(value: str) -> str:
+        return (f"jq '{{{keep}}} | with_entries(select(.value != null)) | .State = \"{value}\"' {state} > {state}.{value.lower()} && "
+                f"aws scheduler update-schedule --cli-input-json file://{state}.{value.lower()}")
+    return [f"### Schedule (EventBridge Scheduler): `{w.name}`", "",
+            "The CronJob is created suspended. Switch between two runs so the job never runs twice or not at all"
+            + (f"; it runs in the schedule's time zone, {d['timezone']}." if d.get("timezone") else "."), "",
+            *_sh(f"aws scheduler get-schedule --name {name} --group-name {group} > {state}",
+                 set_state("DISABLED"),
+                 f"kubectl -n {ns} patch cronjob {w.name} -p '{{\"spec\":{{\"suspend\":false}}}}'"),
+            f"To try the job first, `kubectl -n {ns} create job --from=cronjob/{w.name} {w.name}-manual` runs it once, "
+            "with the same side effects as a scheduled run.", "",
+            "Rollback:", "",
+            *_sh(f"kubectl -n {ns} patch cronjob {w.name} -p '{{\"spec\":{{\"suspend\":true}}}}'", set_state("ENABLED"))]
+
+
 def _schedule(plan: Plan, w: Workload, t: Target) -> list[str]:
+    if w.trigger.details.get("source") == "scheduler":
+        return _scheduler(plan, w, t)
     ns = t.namespace
     rule = w.trigger.details.get("rule_arn")
     find = (f"RULE={rule.split('/')[-1]}" if rule else
@@ -175,7 +200,33 @@ def _schedule(plan: Plan, w: Workload, t: Target) -> list[str]:
             *_sh(f"kubectl -n {ns} patch cronjob {w.name} -p '{{\"spec\":{{\"suspend\":true}}}}'", "aws events enable-rule --name \"$RULE\"")]
 
 
-SECTIONS = {HTTP: _http, INVOKE: _invoke, SQS: _sqs, S3: _s3, SNS: _sns, KINESIS: _stream, DYNAMODB: _stream, SCHEDULE: _schedule}
+def _sfn(plan: Plan, w: Workload, t: Target) -> list[str]:
+    ns = t.namespace
+    out = [f"### Step Functions: `{w.name}` (activity `{t.activity_name(plan)}`)", "",
+           "The workers are already polling the activity; nothing reaches it until a state machine calls it. Switching a "
+           "state machine affects executions started afterwards. Executions already running keep calling the Lambda, so "
+           "keep the Lambda until they have finished.", ""]
+    for name, (_new, done, notes, d) in sfn_rewrites(plan, t).items():
+        arn = d.get("state_machine_arn") or f"arn:aws:states:{t.region}:{t.account}:stateMachine:{name}"
+        out += [f"State machine `{name}`: {', '.join(f'`{p}`' for p in done)} now call the activity." + (
+            " Others stay on Lambda: " + "; ".join(notes) if notes else ""), ""]
+        if not d.get("state_machine_arn"):
+            out += ["The definition came from the template, so its `${...}` substitutions are still in "
+                    f"`cutover/sfn-{name}.json`. Put the rewritten states into the template instead of running the update below.", ""]
+        out += _sh(f"kubectl -n {ns} rollout status deploy/{w.name}",
+                   f"aws stepfunctions describe-state-machine --state-machine-arn {arn} --query definition --output text \\",
+                   f"  > cutover/.state/sfn-{name}-before.json",
+                   f"diff <(jq -S . cutover/.state/sfn-{name}-before.json) <(jq -S . cutover/sfn-{name}.json)   # only the function's states",
+                   f"aws stepfunctions update-state-machine --state-machine-arn {arn} --definition file://cutover/sfn-{name}.json")
+        out += ["Check: start an execution with a known input and watch "
+                f"`kubectl -n {ns} logs deploy/{w.name}`; the state's output should match what the Lambda returned.", "",
+                "Rollback:", "",
+                *_sh(f"aws stepfunctions update-state-machine --state-machine-arn {arn} --definition file://cutover/.state/sfn-{name}-before.json")]
+    return out
+
+
+SECTIONS = {HTTP: _http, INVOKE: _invoke, SQS: _sqs, S3: _s3, SNS: _sns, KINESIS: _stream, DYNAMODB: _stream, SCHEDULE: _schedule,
+            SFN: _sfn}
 
 
 def runbook(plan: Plan, t: Target, has_infra: bool, has_worker_policy: bool) -> str:

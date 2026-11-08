@@ -8,7 +8,8 @@ from typing import Any
 
 import yaml
 
-from ..model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SNS, SQS, UNSUPPORTED, FunctionSpec, Trigger
+from ..model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SFN, SNS, SQS, UNSUPPORTED, FunctionSpec, Trigger
+from ..stepfunctions import find_tasks
 
 
 class _CfnLoader(yaml.SafeLoader):
@@ -132,6 +133,7 @@ def _to_spec(logical_id: str, name: str, rtype: str, props: dict[str, Any],
         if props.get("FunctionUrlConfig"):
             spec.triggers.append(Trigger(HTTP, {"method": "ANY", "path": None, "event_format": "2.0", "source": "function-url"}))
     spec.triggers.extend(_cfn_triggers(logical_id, resources, warnings))
+    spec.triggers.extend(_sfn_triggers(logical_id, name, resources, base, warnings))
     # A template has no region of its own; a resource ARN is the one place it shows up.
     for t in spec.triggers:
         arn = t.details.get("queue_arn") or t.details.get("stream_arn") or t.details.get("topic_arn") or ""
@@ -203,8 +205,15 @@ def _sam_event(ev_id: str, ev: dict[str, Any], resources: dict[str, Any], warnin
             return []
         if p.get("Enabled") is False or p.get("State") == "DISABLED":
             warnings.append(f"event {ev_id}: schedule is disabled in the template; CronJob is created suspended")
-        return [Trigger(SCHEDULE, {"expression": expr, "input": p.get("Input") if isinstance(p.get("Input"), str) else None,
-                                   "suspended": p.get("Enabled") is False or p.get("State") == "DISABLED"})]
+        details = {"expression": expr, "input": p.get("Input") if isinstance(p.get("Input"), str) else None,
+                   "suspended": p.get("Enabled") is False or p.get("State") == "DISABLED",
+                   "source": "scheduler" if etype == "ScheduleV2" else "eventbridge-rule"}
+        if etype == "ScheduleV2":
+            details.update(timezone=p.get("ScheduleExpressionTimezone") if isinstance(p.get("ScheduleExpressionTimezone"), str) else None,
+                           schedule_name=p.get("Name") if isinstance(p.get("Name"), str) else None,
+                           group_name=p.get("GroupName") if isinstance(p.get("GroupName"), str) else "default")
+            _warn_schedule(f"event {ev_id}", p, warnings)
+        return [Trigger(SCHEDULE, details)]
     source = _UNSUPPORTED_EVENTS.get(etype, str(etype).lower())
     return [Trigger(UNSUPPORTED, {"source": source, "detail": f"SAM event {ev_id} ({etype})"})]
 
@@ -237,6 +246,20 @@ def _cfn_triggers(logical_id: str, resources: dict[str, Any], warnings: list[str
                                                   "suspended": p.get("State") == "DISABLED"}))
                 else:
                     out.append(Trigger(UNSUPPORTED, {"source": "eventbridge-rule", "detail": f"Events rule {rid} (event pattern)"}))
+        if res.get("Type") == "AWS::Scheduler::Schedule" and _refers_to((p.get("Target") or {}).get("Arn"), logical_id):
+            expr = p.get("ScheduleExpression")
+            if not isinstance(expr, str):
+                warnings.append(f"schedule {rid}: schedule expression is not a literal")
+            else:
+                target = p.get("Target") or {}
+                _warn_schedule(f"schedule {rid}", {**p, "DeadLetterConfig": target.get("DeadLetterConfig")}, warnings)
+                out.append(Trigger(SCHEDULE, {
+                    "expression": expr, "source": "scheduler",
+                    "timezone": p.get("ScheduleExpressionTimezone") if isinstance(p.get("ScheduleExpressionTimezone"), str) else None,
+                    "input": target.get("Input") if isinstance(target.get("Input"), str) else None,
+                    "schedule_name": p.get("Name") if isinstance(p.get("Name"), str) else None,
+                    "group_name": p.get("GroupName") if isinstance(p.get("GroupName"), str) else "default",
+                    "suspended": p.get("State") == "DISABLED", "detail": f"EventBridge Scheduler schedule {rid}"}))
         if res.get("Type") == "AWS::SNS::Subscription" and p.get("Protocol") == "lambda" and _refers_to(p.get("Endpoint"), logical_id):
             out.append(Trigger(SNS, {"topic_arn": _topic_arn(p.get("TopicArn"), resources, warnings),
                                      "filter_policy": p.get("FilterPolicy"), "filter_policy_scope": p.get("FilterPolicyScope"),
@@ -251,6 +274,67 @@ def _cfn_triggers(logical_id: str, resources: dict[str, Any], warnings: list[str
                     out.append(Trigger(S3, {"bucket": _bucket_name({"Ref": rid}, resources, warnings), "events": [cfg.get("Event")],
                                             "filter_rules": ((cfg.get("Filter") or {}).get("S3Key") or {}).get("Rules") or [],
                                             "detail": f"S3 bucket {rid} notification"}))
+    return out
+
+
+def _warn_schedule(where: str, p: dict[str, Any], warnings: list[str]) -> None:
+    if (p.get("FlexibleTimeWindow") or {}).get("Mode") == "FLEXIBLE":
+        warnings.append(f"{where}: the flexible time window is not reproduced; the CronJob starts on time")
+    if p.get("StartDate") or p.get("EndDate"):
+        warnings.append(f"{where}: StartDate/EndDate are not reproduced; suspend or delete the CronJob by hand")
+    if p.get("DeadLetterConfig"):
+        warnings.append(f"{where}: the scheduler's dead-letter queue is not reproduced; failed Jobs stay in the cluster")
+
+
+def _sfn_definition(rid: str, p: dict[str, Any], base: Path, warnings: list[str]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """(definition, substitutions) of a SAM or CloudFormation state machine, or (None, {}) when it is not in the template."""
+    subs = dict(p.get("DefinitionSubstitutions") or {})
+    definition: Any = p.get("Definition")
+    if definition is None and isinstance(p.get("DefinitionUri"), str):
+        path = base / p["DefinitionUri"]
+        if not path.is_file():
+            warnings.append(f"state machine {rid}: {p['DefinitionUri']} not found")
+            return None, {}
+        text = path.read_text()
+        definition = json.loads(text) if path.suffix == ".json" else yaml.load(text, Loader=_CfnLoader)  # noqa: S506
+    if definition is None and p.get("DefinitionString") is not None:
+        ds = p["DefinitionString"]
+        if isinstance(ds, dict) and "Fn::Sub" in ds:
+            sub = ds["Fn::Sub"]
+            ds, extra = (sub[0], sub[1] if len(sub) > 1 else {}) if isinstance(sub, list) else (sub, {})
+            subs.update(extra or {})
+        if not isinstance(ds, str):
+            warnings.append(f"state machine {rid}: DefinitionString is built with {_describe(ds)}; Step Functions calls not checked")
+            return None, {}
+        try:
+            definition = json.loads(ds)
+        except ValueError:
+            warnings.append(f"state machine {rid}: DefinitionString is not JSON once substitutions are left in")
+            return None, {}
+    return (definition if isinstance(definition, dict) else None), subs
+
+
+def _sfn_triggers(logical_id: str, name: str, resources: dict[str, Any], base: Path, warnings: list[str]) -> list[Trigger]:
+    out = []
+    for rid, res in resources.items():
+        if res.get("Type") not in ("AWS::Serverless::StateMachine", "AWS::StepFunctions::StateMachine"):
+            continue
+        p = res.get("Properties") or {}
+        definition, subs = _sfn_definition(rid, p, base, warnings)
+        if definition is None:
+            continue
+        # ${Key} placeholders whose substitution is this function, and inline ${Logical.Arn} references.
+        refs = [f"${{{k}}}" for k, v in subs.items() if _refers_to(v, logical_id)] + [f"${{{logical_id}.Arn}}", f"${{{logical_id}}}"]
+        tasks = find_tasks(definition, name, refs)
+        if not tasks:
+            continue
+        sm_name = p.get("Name") or p.get("StateMachineName")
+        out.append(Trigger(SFN, {
+            "state_machine_arn": None, "state_machine_name": sm_name if isinstance(sm_name, str) else rid,
+            "type": str(p.get("Type") or p.get("StateMachineType") or "STANDARD").upper(),
+            "definition": definition, "refs": refs, "tasks": tasks, "logical_id": rid,
+            "detail": f"Step Functions state machine {rid} ({', '.join(t['path'] for t in tasks)})",
+        }))
     return out
 
 

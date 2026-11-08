@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from .generate import PAUSED, dump_yaml
-from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SQS, STREAMS
+from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SFN, SQS, STREAMS
 from .plan import Plan
 
 
@@ -98,9 +98,12 @@ def chart(plan: Plan, files: dict[str, list[dict[str, Any]]], iam_mode: str) -> 
                 doc["spec"]["replicas"] = tok.value(f"{_wl(name)}.minReplicas")
             elif kind == "Deployment" and wkind in (SQS, *BRIDGED, *STREAMS):
                 doc["spec"]["replicas"] = tok.value(f"ternary 0 1 {_wl(name)}.paused")
+            elif kind == "Deployment" and wkind == SFN:
+                values["workloads"].setdefault(name, {})["replicas"] = doc["spec"]["replicas"]
+                doc["spec"]["replicas"] = tok.value(f"{_wl(name)}.replicas")
             pod = (doc["spec"]["template"]["spec"] if kind == "Deployment" else
                    doc["spec"]["jobTemplate"]["spec"]["template"]["spec"] if kind == "CronJob" else None)
-            if pod and wkind in (HTTP, INVOKE, SQS, SCHEDULE, *BRIDGED, *STREAMS):
+            if pod and wkind in (HTTP, INVOKE, SQS, SCHEDULE, SFN, *BRIDGED, *STREAMS):
                 for c in pod["containers"]:
                     c["image"] = tok.value('printf "%s:%s" .Values.image.repository .Values.image.tag')
                     # Memory is per workload: queue and stream pods carry the shim's poller on top of the function.

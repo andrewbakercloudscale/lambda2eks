@@ -54,7 +54,8 @@ rancher = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rancher)
 kubectl, run, log, wait_until = rancher.kubectl, rancher.run, rancher.log, rancher.wait_until
 
-# One per trigger kind. dir: folder under samples/, kind: how check-lambda/check-eks drive it.
+# One per trigger kind. dir: folder under samples/, kind: how check-lambda/check-eks drive it,
+# function: the logical id of the function to migrate when the stack has more than one.
 SAMPLES = [
     {"dir": "apigw-http-api-lambda", "template": "template.yml", "kind": "http-v2"},
     {"dir": "apigw-rest-api-lambda-python", "kind": "rest"},
@@ -63,7 +64,11 @@ SAMPLES = [
     {"dir": "sns-lambda-nodejs-sam", "kind": "sns"},
     {"dir": "dynamodb-lambda", "kind": "dynamodb"},
     {"dir": "kinesis-lambda", "kind": "kinesis"},
-    {"dir": "eventbridge-scheduled-lambda", "kind": "schedule"},
+    {"dir": "eventbridge-scheduled-lambda", "kind": "schedule", "expect": "Hello World"},
+    # Its schedule is named "${AWS::StackName}-schedule", at most 64 characters, so the stack needs a short name.
+    {"dir": "eventbridge-schedule-to-lambda-dlq-sam-python", "kind": "scheduler", "expect": "Completed Successfully",
+     "stack": "l2e-sample-scheduler-dlq"},
+    {"dir": "sfn-lambda-lambda", "kind": "sfn", "function": "FirstFunction"},
     {"dir": "sam-quickstart-s3", "kind": "s3"},
 ]
 
@@ -80,7 +85,7 @@ class Ctx:
         return self.session.client(name)
 
     def stack(self, sample: dict) -> str:
-        return f"l2e-sample-{sample['dir']}"
+        return sample.get("stack") or f"l2e-sample-{sample['dir']}"
 
     def resources(self, sample: dict) -> dict[str, list[str]]:
         """CloudFormation resource type -> physical ids, for one sample's stack."""
@@ -90,6 +95,9 @@ class Ctx:
         return out
 
     def function(self, sample: dict) -> str:
+        if sample.get("function"):
+            return self.client("cloudformation").describe_stack_resource(
+                StackName=self.stack(sample), LogicalResourceId=sample["function"])["StackResourceDetail"]["PhysicalResourceId"]
         return self.resources(sample)["AWS::Lambda::Function"][0]
 
     def outputs(self, sample: dict) -> dict[str, str]:
@@ -118,6 +126,10 @@ UPSTREAM_FIXES = {
     # template says app.lambdaHandler, app.js exports handler: Runtime.HandlerNotFound on every batch.
     "kinesis-lambda": [("Handler: app.lambdaHandler", "Handler: app.handler")],
 }
+# Changes that only make the test faster, applied the same way.
+SPEED_TWEAKS = {
+    "eventbridge-schedule-to-lambda-dlq-sam-python": [("ScheduleExpression: rate(5 minutes)", "ScheduleExpression: rate(1 minute)")],
+}
 
 
 def stage(sample: dict) -> Path:
@@ -127,7 +139,7 @@ def stage(sample: dict) -> Path:
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
     template = dst / sample.get("template", "template.yaml")
-    for old, new in UPSTREAM_FIXES.get(sample["dir"], []):
+    for old, new in UPSTREAM_FIXES.get(sample["dir"], []) + SPEED_TWEAKS.get(sample["dir"], []):
         text = template.read_text()
         assert old in text, f"{sample['dir']}: upstream fix no longer applies ({old!r}); drop it"
         template.write_text(text.replace(old, new))
@@ -234,9 +246,20 @@ def check_lambda_one(ctx: Ctx, sample: dict) -> str:
         status, body = http_get(url, signed=ctx)
         assert status == 200 and body == "Hello World", f"{status} {body[:200]}"
         return "unsigned 403, SigV4-signed 200"
-    if kind == "schedule":
-        wait_until("a scheduled run in CloudWatch", lambda: lambda_logged(ctx, fn, "Hello World", since - 120_000), 150, 10)
-        return "rate(1 minute) run logged Hello World"
+    if kind in ("schedule", "scheduler"):
+        wait_until("a scheduled run in CloudWatch", lambda: lambda_logged(ctx, fn, sample["expect"], since - 120_000), 150, 10)
+        if kind == "schedule":
+            return f"rate(1 minute) run logged {sample['expect']}"
+        # The sample logs the event it was given: what Scheduler sends a function when the target has no Input.
+        logged = ctx.client("logs").filter_log_events(logGroupName=f"/aws/lambda/{fn}", startTime=since - 120_000,
+                                                      filterPattern='"invoked by EventBridge Scheduler"')["events"]
+        event = json.loads(logged[-1]["message"].split("\t")[-1].strip())["event"] if logged else "not logged"
+        (OUT / "scheduler-event.json").write_text(json.dumps(event))
+        return f"Scheduler run logged {sample['expect']}; event without Input was {json.dumps(event)}"
+    if kind == "sfn":
+        out = run_execution(ctx, sample, marker)
+        wait_until(f"{marker} in /aws/lambda/{fn}", lambda: lambda_logged(ctx, fn, marker, since), 120, 5)
+        return f"execution SUCCEEDED, output {out[:80]}; marker in the Lambda's log"
     send(ctx, sample, marker)
 
     def seen():
@@ -246,6 +269,33 @@ def check_lambda_one(ctx: Ctx, sample: dict) -> str:
         return lambda_logged(ctx, fn, marker, since)
     wait_until(f"{marker} in /aws/lambda/{fn}", seen, 240, 10)
     return f"marker {marker} in CloudWatch Logs"
+
+
+def state_machine(ctx: Ctx, sample: dict) -> str:
+    return ctx.resources(sample)["AWS::StepFunctions::StateMachine"][0]
+
+
+def run_execution(ctx: Ctx, sample: dict, marker: str) -> str:
+    """Start the state machine with a marked input; return its output once it has succeeded."""
+    sfn = ctx.client("stepfunctions")
+    arn = sfn.start_execution(stateMachineArn=state_machine(ctx, sample), name=marker, input=json.dumps({"marker": marker}))["executionArn"]
+    wait_until(f"execution {marker} to finish", lambda: sfn.describe_execution(executionArn=arn)["status"] != "RUNNING", 180, 3)
+    ex = sfn.describe_execution(executionArn=arn)
+    assert ex["status"] == "SUCCEEDED", f"{ex['status']}: {ex.get('error')} {ex.get('cause', '')[:300]}"
+    return ex.get("output", "")
+
+
+def task_outputs(ctx: Ctx, marker: str, sample: dict) -> list[str]:
+    """The output of each Task in an execution, in order: TaskSucceeded (Lambda) and ActivitySucceeded (EKS) events."""
+    sfn = ctx.client("stepfunctions")
+    arn = state_machine(ctx, sample).replace(":stateMachine:", ":execution:") + f":{marker}"
+    events = sfn.get_execution_history(executionArn=arn, maxResults=200)["events"]
+    out = []
+    for e in events:
+        for key in ("taskSucceededEventDetails", "activitySucceededEventDetails", "lambdaFunctionSucceededEventDetails"):
+            if key in e:
+                out.append(f"{key.replace('SucceededEventDetails', '')}: {e[key].get('output', '')}")
+    return out
 
 
 # ------------------------------------------------------------------ migrate
@@ -344,6 +394,21 @@ def cut_over(ctx: Ctx, sample: dict, plan) -> str:
         for rule in ctx.resources(sample).get("AWS::Events::Rule", []):
             ctx.client("events").disable_rule(Name=rule)
         return "EventBridge rule disabled"
+    if kind == "scheduler":
+        sched = ctx.client("scheduler")
+        for name in ctx.resources(sample).get("AWS::Scheduler::Schedule", []):
+            s = sched.get_schedule(Name=name)
+            keep = {k: s[k] for k in ("Name", "GroupName", "ScheduleExpression", "ScheduleExpressionTimezone", "FlexibleTimeWindow",
+                                      "Target", "StartDate", "EndDate", "Description", "KmsKeyArn", "ActionAfterCompletion") if s.get(k)}
+            sched.update_schedule(**keep, State="DISABLED")
+        return "Scheduler schedule disabled (update-schedule with State DISABLED)"
+    if kind == "sfn":
+        sfn = ctx.client("stepfunctions")
+        files = sorted((EKS_OUT / plan.k8s_name / "cutover").glob("sfn-*.json"))
+        assert files, "lambda2eks wrote no rewritten state machine definition"
+        for f in files:
+            sfn.update_state_machine(stateMachineArn=state_machine(ctx, sample), definition=f.read_text())
+        return f"state machine updated from {', '.join(f.name for f in files)}: the Task state calls the activity"
     if kind == "sns":
         return "bridge queue subscribed (Lambda still subscribed: the overlap CUTOVER.md warns about)"
     return "HTTP: API Gateway still serves; the pods answer the same requests through Traefik"
@@ -408,14 +473,31 @@ def check_eks_one(ctx: Ctx, sample: dict, name: str) -> str:
             return "GET /hello 200 hello world, with requests + internet egress from the pod"
         assert status == 200 and body == "Hello World", f"{status} {body[:200]}"
         return "200 Hello World; NOTE the unsigned call is accepted: AWS_IAM auth does not exist on the Ingress"
-    if kind == "schedule":
+    if kind in ("schedule", "scheduler"):
         cron = kubectl("-n", NS, "get", "cronjob", "-l", f"app.kubernetes.io/name={name}", "-o", "name", capture=True).stdout.strip()
         job = f"check-{marker}"
         kubectl("-n", NS, "create", "job", job, f"--from={cron}", capture=True)
         kubectl("-n", NS, "wait", f"job/{job}", "--for=condition=complete", "--timeout=180s", capture=True)
         logs = kubectl("-n", NS, "logs", f"job/{job}", capture=True).stdout
-        assert "Hello World" in logs, logs[-300:]
-        return "Job from the CronJob printed Hello World"
+        assert sample["expect"] in logs, logs[-300:]
+        if kind == "schedule":
+            return f"Job from the CronJob printed {sample['expect']}"
+        seen = OUT / "scheduler-event.json"
+        if seen.exists():
+            # Same event as Scheduler sent the Lambda, apart from its id and time.
+            line = next(l for l in logs.splitlines() if "invoked by EventBridge Scheduler" in l)
+            got = json.loads(line[line.index("{"):])["event"]
+            want = json.loads(seen.read_text())
+            strip = lambda e: {k: v for k, v in e.items() if k not in ("id", "time")} if isinstance(e, dict) else e  # noqa: E731
+            assert strip(got) == strip(want), f"Lambda got {want}, the pod got {got}"
+        return f"Job from the CronJob printed {sample['expect']}, with the event Scheduler sent the Lambda (id and time aside)"
+    if kind == "sfn":
+        out = run_execution(ctx, sample, marker)
+        selector = f"app.kubernetes.io/name={name}"
+        wait_until(f"{marker} in the pod logs", lambda: marker in pod_logs(selector), 60, 3)
+        steps = task_outputs(ctx, marker, sample)
+        assert steps and steps[0].startswith("activity:") and "from Lambda1" in steps[0], steps
+        return f"execution SUCCEEDED through the activity; first task output {steps[0][:70]}; final output {out[:60]}"
     selector = f"app.kubernetes.io/name={name}"
     if kind == "kinesis":
         # StartingPosition LATEST: only records written after the consumer holds the shard reach it.

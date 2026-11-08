@@ -2,8 +2,9 @@
 
 Replaces the Lambda runtime inside a Lambda base image and calls the unchanged handler.
 Modes (L2E_MODE): http (API Gateway events + Invoke API), sqs (queue worker, optionally unwrapping
-S3 or SNS events from a bridge queue), stream (Kinesis / DynamoDB Streams consumer), schedule (one run).
-Standard library only, except boto3 in sqs and stream modes (the Lambda Python base image ships it).
+S3 or SNS events from a bridge queue), stream (Kinesis / DynamoDB Streams consumer), schedule (one run),
+activity (Step Functions activity worker).
+Standard library only, except boto3 in sqs, stream and activity modes (the Lambda Python base image ships it).
 """
 
 import base64
@@ -745,19 +746,142 @@ def run_stream(invoker):
 
 # ------------------------------------------------------------------ schedule mode
 
-def run_schedule(invoker):
+def year_allowed(spec, year):
+    """spec is 2027, 2026-2028 or 2026,2028 (the forms lambda2eks passes); an empty spec allows any year."""
+    if not spec:
+        return True
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        if int(lo) <= year <= int(hi or lo):
+            return True
+    return False
+
+
+def current_year(tz):
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz)).year
+    except Exception:  # noqa: BLE001 - no tz database in the image: UTC differs only around New Year
+        return datetime.now(timezone.utc).year
+
+
+def scheduler_input(raw, now=None, execution_id=None):
+    """EventBridge Scheduler fills these context attributes into a target's input before delivering it."""
+    now = now or datetime.now(timezone.utc)
+    values = {
+        "<aws.scheduler.schedule-arn>": os.environ.get("L2E_SCHEDULE_ARN", ""),
+        "<aws.scheduler.scheduled-time>": now.replace(second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "<aws.scheduler.execution-id>": execution_id or str(uuid.uuid4()),
+        "<aws.scheduler.attempt-number>": "1",
+    }
+    for k, v in values.items():
+        raw = raw.replace(k, v)
+    return raw
+
+
+def schedule_event():
     raw = os.environ.get("L2E_SCHEDULE_INPUT")
+    scheduler = os.environ.get("L2E_SCHEDULE_SOURCE") == "scheduler"
     if raw:
-        event = json.loads(raw)
-    else:
-        event = {
-            "version": "0", "id": str(uuid.uuid4()), "detail-type": "Scheduled Event", "source": "aws.events",
-            "account": ACCOUNT, "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "region": REGION,
-            "resources": [r for r in [os.environ.get("L2E_SCHEDULE_RULE_ARN")] if r], "detail": {},
-        }
-    ok, result = invoker.invoke(event)
+        return json.loads(scheduler_input(raw) if scheduler else raw)
+    # Without an input, both send a Scheduled Event; Scheduler's (seen on real AWS) has detail as the string "{}".
+    arn = os.environ.get("L2E_SCHEDULE_ARN" if scheduler else "L2E_SCHEDULE_RULE_ARN")
+    return {
+        "version": "0", "id": str(uuid.uuid4()), "detail-type": "Scheduled Event",
+        "source": "aws.scheduler" if scheduler else "aws.events",
+        "account": ACCOUNT, "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "region": REGION,
+        "resources": [arn] if arn else [], "detail": "{}" if scheduler else {},
+    }
+
+
+def run_schedule(invoker):
+    years = os.environ.get("L2E_SCHEDULE_YEARS", "")
+    if not year_allowed(years, current_year(os.environ.get("L2E_SCHEDULE_TZ", "UTC"))):
+        log.info("scheduled run skipped: the schedule only runs in %s", years)
+        return 0
+    ok, result = invoker.invoke(schedule_event())
     log.info("scheduled run %s: %s", "succeeded" if ok else "failed", json.dumps(result, default=str)[:2000])
     return 0 if ok else 1
+
+
+# ------------------------------------------------------------------ activity mode (Step Functions)
+#
+# The rewritten Task state calls an activity. Each poller asks Step Functions for a task (a long poll of
+# up to 60 s), runs the handler with the task's input and reports the result, or the error with the
+# exception type as its name, as Lambda reports it, so the state's Retry and Catch rules still match.
+
+def task_failure(result):
+    """(error, cause) for SendTaskFailure, the way Step Functions reports a failed Lambda."""
+    error = str(result.get("errorType") or "Error")
+    if error == "TimeoutError" and str(result.get("errorMessage", "")).startswith("Task timed out"):
+        error = "Sandbox.Timedout"  # the error name Lambda gives a timed-out invocation
+    cause = json.dumps({k: result.get(k) for k in ("errorMessage", "errorType", "stackTrace") if k in result})
+    return error[:256], cause[:32768]
+
+
+def run_task(sfn, invoker, task, heartbeat_s):
+    token = task["taskToken"]
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(heartbeat_s):
+            try:
+                sfn.send_task_heartbeat(taskToken=token)
+            except Exception as e:  # noqa: BLE001 - a lost heartbeat shows as a heartbeat timeout, if one is set
+                log.warning("heartbeat failed: %s", e)
+    if heartbeat_s > 0:
+        threading.Thread(target=beat, daemon=True).start()
+    try:
+        try:
+            event = json.loads(task.get("input") or "{}")
+        except ValueError as e:
+            ok, result = False, {"errorType": "InvalidInput", "errorMessage": f"task input is not JSON: {e}"}
+        else:
+            ok, result = invoker.invoke(event)
+    finally:
+        stop.set()
+    try:
+        if ok:
+            sfn.send_task_success(taskToken=token, output=json.dumps(result, default=str))
+        else:
+            error, cause = task_failure(result)
+            sfn.send_task_failure(taskToken=token, error=error, cause=cause)
+    except Exception:  # noqa: BLE001 - the state already timed out, or the output is over 256 KB
+        log.exception("could not report the task result; the state ends by its TimeoutSeconds")
+    return ok
+
+
+def run_activity(invoker, client=None):
+    activity = os.environ["L2E_SFN_ACTIVITY_ARN"]
+    heartbeat_s = float(os.environ.get("L2E_SFN_HEARTBEAT_S", "20"))
+    if client is None:
+        import boto3
+        from botocore.config import Config
+        # GetActivityTask holds the connection for up to 60 s; the default 60 s read timeout would cut it off.
+        client = boto3.client("stepfunctions", region_name=REGION, config=Config(read_timeout=70, retries={"max_attempts": 3}))
+    sfn = client
+    stopping = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: (log.info("SIGTERM: finishing the current task"), stopping.set()))
+    worker = os.environ.get("HOSTNAME", "lambda2eks")[:80]
+    log.info("activity mode on %s", activity)
+
+    def poll():
+        while not stopping.is_set():
+            try:
+                task = sfn.get_activity_task(activityArn=activity, workerName=worker)
+            except Exception:  # noqa: BLE001 - keep polling through throttling and network errors
+                log.exception("get_activity_task failed; retrying in 5s")
+                stopping.wait(5)
+                continue
+            if task.get("taskToken"):
+                run_task(sfn, invoker, task, heartbeat_s)
+
+    pollers = [threading.Thread(target=poll, daemon=True) for _ in range(int(os.environ.get("L2E_CONCURRENCY", "1")))]
+    for t in pollers:
+        t.start()
+    for t in pollers:
+        t.join()
+    return 0
 
 
 def main():
@@ -770,6 +894,8 @@ def main():
         return run_sqs(invoker)
     if mode == "stream":
         return run_stream(invoker)
+    if mode == "activity":
+        return run_activity(invoker)
     if mode == "schedule":
         code = run_schedule(invoker)
         os._exit(code)  # do not wait for a timed-out handler thread

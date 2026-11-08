@@ -2,8 +2,9 @@
 //
 // Replaces the Lambda runtime inside a Lambda base image and calls the unchanged handler.
 // Modes (L2E_MODE): http (API Gateway events + Invoke API), sqs (queue worker, optionally unwrapping
-// S3 or SNS events from a bridge queue), stream (Kinesis / DynamoDB Streams consumer), schedule (one run).
-// Node built-ins only, except the AWS SDK v3 clients in sqs and stream modes (the Lambda Node base image ships them).
+// S3 or SNS events from a bridge queue), stream (Kinesis / DynamoDB Streams consumer), schedule (one run),
+// activity (Step Functions activity worker).
+// Node built-ins only, except the AWS SDK v3 clients in sqs, stream and activity modes (the Lambda Node base image ships them).
 
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
@@ -724,15 +725,126 @@ async function runStream(invoker) {
 
 // ------------------------------------------------------------------ schedule mode
 
-async function runSchedule(invoker) {
-  const event = env.L2E_SCHEDULE_INPUT ? JSON.parse(env.L2E_SCHEDULE_INPUT) : {
-    version: '0', id: randomUUID(), 'detail-type': 'Scheduled Event', source: 'aws.events', account: ACCOUNT,
-    time: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'), region: REGION,
-    resources: env.L2E_SCHEDULE_RULE_ARN ? [env.L2E_SCHEDULE_RULE_ARN] : [], detail: {},
+// spec is 2027, 2026-2028 or 2026,2028 (the forms lambda2eks passes); an empty spec allows any year.
+export function yearAllowed(spec, year) {
+  if (!spec) return true;
+  return spec.split(',').some((part) => {
+    const [lo, hi] = part.split('-').map(Number);
+    return year >= lo && year <= (hi || lo);
+  });
+}
+
+function currentYear(tz) {
+  try {
+    return Number(new Intl.DateTimeFormat('en', { timeZone: tz, year: 'numeric' }).format(new Date()));
+  } catch {
+    return new Date().getUTCFullYear(); // unknown zone: UTC differs only around New Year
+  }
+}
+
+// EventBridge Scheduler fills these context attributes into a target's input before delivering it.
+export function schedulerInput(raw, now = new Date(), executionId = randomUUID()) {
+  const minute = new Date(now);
+  minute.setUTCSeconds(0, 0);
+  const values = {
+    '<aws.scheduler.schedule-arn>': env.L2E_SCHEDULE_ARN || '',
+    '<aws.scheduler.scheduled-time>': minute.toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    '<aws.scheduler.execution-id>': executionId,
+    '<aws.scheduler.attempt-number>': '1',
   };
-  const [ok, result] = await invoker.invoke(event);
+  for (const [k, v] of Object.entries(values)) raw = raw.split(k).join(v);
+  return raw;
+}
+
+export function scheduleEvent() {
+  const raw = env.L2E_SCHEDULE_INPUT;
+  const scheduler = env.L2E_SCHEDULE_SOURCE === 'scheduler';
+  if (raw) return JSON.parse(scheduler ? schedulerInput(raw) : raw);
+  // Without an input, both send a Scheduled Event; Scheduler's (seen on real AWS) has detail as the string "{}".
+  const arn = scheduler ? env.L2E_SCHEDULE_ARN : env.L2E_SCHEDULE_RULE_ARN;
+  return {
+    version: '0', id: randomUUID(), 'detail-type': 'Scheduled Event', source: scheduler ? 'aws.scheduler' : 'aws.events',
+    account: ACCOUNT, time: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'), region: REGION,
+    resources: arn ? [arn] : [], detail: scheduler ? '{}' : {},
+  };
+}
+
+async function runSchedule(invoker) {
+  const years = env.L2E_SCHEDULE_YEARS || '';
+  if (!yearAllowed(years, currentYear(env.L2E_SCHEDULE_TZ || 'UTC'))) {
+    log('INFO', `scheduled run skipped: the schedule only runs in ${years}`);
+    process.exit(0);
+  }
+  const [ok, result] = await invoker.invoke(scheduleEvent());
   log(ok ? 'INFO' : 'ERROR', `scheduled run ${ok ? 'succeeded' : 'failed'}: ${JSON.stringify(result ?? null).slice(0, 2000)}`);
   process.exit(ok ? 0 : 1);
+}
+
+// ------------------------------------------------------------------ activity mode (Step Functions)
+//
+// Same design as the Python shim: each poller long-polls the activity, runs the handler with the task's
+// input and reports the result, or the error with its name, so the state's Retry and Catch still match.
+
+export function taskFailure(result) {
+  let error = String(result?.errorType || 'Error');
+  if (error === 'TimeoutError' && String(result?.errorMessage || '').startsWith('Task timed out')) error = 'Sandbox.Timedout';
+  const cause = JSON.stringify({ errorMessage: result?.errorMessage, errorType: result?.errorType, stackTrace: result?.stackTrace });
+  return [error.slice(0, 256), cause.slice(0, 32768)];
+}
+
+export async function runTask(sfn, invoker, task, heartbeatS) {
+  const token = task.taskToken;
+  const timer = heartbeatS > 0 ? setInterval(() => {
+    sfn('SendTaskHeartbeat', { taskToken: token }).catch((e) => log('WARN', `heartbeat failed: ${e?.message || e}`));
+  }, heartbeatS * 1000) : null;
+  let ok;
+  let result;
+  try {
+    let event;
+    try {
+      event = JSON.parse(task.input || '{}');
+    } catch (e) {
+      [ok, result] = [false, { errorType: 'InvalidInput', errorMessage: `task input is not JSON: ${e.message}` }];
+    }
+    if (ok === undefined) [ok, result] = await invoker.invoke(event);
+  } finally {
+    if (timer) clearInterval(timer);
+  }
+  try {
+    if (ok) await sfn('SendTaskSuccess', { taskToken: token, output: JSON.stringify(result ?? null) });
+    else {
+      const [error, cause] = taskFailure(result);
+      await sfn('SendTaskFailure', { taskToken: token, error, cause });
+    }
+  } catch (e) {
+    log('ERROR', `could not report the task result; the state ends by its TimeoutSeconds: ${e?.message || e}`);
+  }
+  return ok;
+}
+
+async function runActivity(invoker) {
+  const sfn = await sdkCaller('@aws-sdk/client-sfn', 'SFNClient');
+  const activityArn = env.L2E_SFN_ACTIVITY_ARN;
+  const heartbeatS = Number(env.L2E_SFN_HEARTBEAT_S || '20');
+  const workerName = (env.HOSTNAME || 'lambda2eks').slice(0, 80);
+  let stopping = false;
+  process.on('SIGTERM', () => { log('INFO', 'SIGTERM: finishing the current task'); stopping = true; });
+  log('INFO', `activity mode on ${activityArn}`);
+  const poll = async () => {
+    while (!stopping) {
+      let task;
+      try {
+        task = await sfn('GetActivityTask', { activityArn, workerName });
+      } catch (e) {
+        log('ERROR', `GetActivityTask failed, retrying in 5s: ${e?.message || e}`);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      if (task.taskToken) await runTask(sfn, invoker, task, heartbeatS);
+    }
+  };
+  await Promise.all(Array.from({ length: Number(env.L2E_CONCURRENCY || '1') }, poll));
+  process.exit(0);
 }
 
 async function main() {
@@ -742,6 +854,7 @@ async function main() {
   if (mode === 'sqs') return runSqs(invoker);
   if (mode === 'stream') return runStream(invoker);
   if (mode === 'schedule') return runSchedule(invoker);
+  if (mode === 'activity') return runActivity(invoker);
   throw new Error(`unknown L2E_MODE ${mode}`);
 }
 

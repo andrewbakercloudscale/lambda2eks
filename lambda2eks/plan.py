@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SQS, STREAMS, UNSUPPORTED, FunctionSpec, Trigger
+from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SFN, SQS, STREAMS, UNSUPPORTED, FunctionSpec, Trigger
 
 LAMBDA_MB_PER_VCPU = 1769  # Lambda allocates one full vCPU at 1,769 MB
 SECRET_KEY = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|API_?KEY|PRIVATE|CREDENTIAL|DSN|CONN(ECTION)?_?STR|WEBHOOK)", re.I)
@@ -15,7 +15,7 @@ MAX_REPLICAS_CAP = 200
 
 @dataclass
 class Workload:
-    kind: str            # http | invoke | sqs | schedule | s3 | sns | kinesis | dynamodb
+    kind: str            # http | invoke | sqs | schedule | s3 | sns | kinesis | dynamodb | stepfunctions
     name: str            # Kubernetes object name
     trigger: Trigger | None
     bridge_queue: str | None = None  # s3/sns: the SQS queue lambda2eks puts between the source and the worker
@@ -44,6 +44,7 @@ class Plan:
     http_max_replicas: int = 10
     sqs_max_replicas: int = 20
     stream_max_replicas: int = 4
+    sfn_replicas: int = 2
     ingress_scheme: str = "internal"
     schedule_concurrency_policy: str = "Allow"
     secret_env_keys: list[str] = field(default_factory=list)
@@ -112,6 +113,7 @@ def baseline_plan(spec: FunctionSpec, registry: str) -> Plan:
         plan.decide("sqs_max_replicas", 20, "rule", "no reserved concurrency set; conservative ceiling")
         plan.decide("stream_max_replicas", 4, "rule", "no reserved concurrency set; KEDA scales with the shard count up to this")
     plan.decide("http_min_replicas", 2, "rule", "two replicas for availability across nodes")
+    plan.decide("sfn_replicas", 2, "rule", "two activity workers for availability; tasks wait at the activity for a free worker")
     plan.decide("ingress_scheme", "internal", "rule", "internal load balancer until someone decides it should be public")
     plan.decide("schedule_concurrency_policy", "Allow", "rule", "EventBridge lets scheduled invocations overlap")
     keys = sorted(k for k in spec.environment if SECRET_KEY.search(k))
@@ -143,7 +145,27 @@ def baseline_plan(spec: FunctionSpec, registry: str) -> Plan:
     for t in (t for t in spec.triggers if t.kind in STREAMS):
         source = t.details.get("stream_name") or t.details.get("table_name") or "stream"
         plan.workloads.append(Workload(t.kind, _unique(plan, f"{name}-{t.kind}-{k8s_name(source)}"[:52].rstrip("-")), t))
-    plan.unsupported_triggers = [t for t in spec.triggers if t.kind == UNSUPPORTED]
+    machines, sfn_unsupported = [], []
+    for t in (t for t in spec.triggers if t.kind == SFN):
+        d = t.details
+        sm = d.get("state_machine_name") or "state machine"
+        if d.get("type") == "EXPRESS":
+            sfn_unsupported.append(Trigger(UNSUPPORTED, {"source": "stepfunctions-express", "detail": (
+                f"Express state machine {sm}: Express workflows cannot call activities. Keep the function on Lambda, "
+                "or call an authenticated HTTPS endpoint from the state with the HTTP Task (arn:aws:states:::http:invoke)")}))
+        elif not any(task["problem"] is None for task in d.get("tasks") or []):
+            sfn_unsupported.append(Trigger(UNSUPPORTED, {"source": "stepfunctions", "detail": f"state machine {sm}: " + "; ".join(
+                f"{task['path']} {task['problem']}" for task in d.get("tasks") or [])}))
+        else:
+            machines.append(d)
+            for task in d["tasks"]:
+                if task["problem"]:
+                    note = f"state machine {sm}, state {task['path']}: stays on Lambda, it {task['problem']}"
+                    if note not in spec.warnings:
+                        spec.warnings.append(note)
+    if machines:
+        plan.workloads.append(Workload(SFN, _unique(plan, f"{name}-sfn"), Trigger(SFN, {"machines": machines})))
+    plan.unsupported_triggers = [t for t in spec.triggers if t.kind == UNSUPPORTED] + sfn_unsupported
     if not plan.workloads:
         plan.workloads.append(Workload(INVOKE, f"{name}-invoke", None))
     return plan

@@ -9,11 +9,12 @@ from typing import Any
 # Trigger kinds the tool turns into a workload. Anything else is reported, not migrated.
 HTTP = "http"          # API Gateway REST/HTTP API or a function URL -> Deployment + Service + Ingress
 SQS = "sqs"            # SQS event source mapping -> worker Deployment + KEDA ScaledObject
-SCHEDULE = "schedule"  # EventBridge schedule -> CronJob
+SCHEDULE = "schedule"  # EventBridge rule schedule or EventBridge Scheduler schedule -> CronJob
 S3 = "s3"              # S3 notifications -> bridge SQS queue -> worker that unwraps them
 SNS = "sns"            # SNS subscription -> bridge SQS queue -> worker that rebuilds the SNS event
 KINESIS = "kinesis"    # Kinesis event source mapping -> stream consumer + KEDA
 DYNAMODB = "dynamodb"  # DynamoDB stream event source mapping -> stream consumer + KEDA
+SFN = "stepfunctions"  # Step Functions Task states -> activity worker Deployment; the states call the activity
 INVOKE = "invoke"      # no trigger found: called through the Invoke API -> Deployment + Service
 UNSUPPORTED = "unsupported"
 
@@ -26,7 +27,10 @@ class Trigger:
     kind: str
     # http: method, path, event_format ("1.0" REST, "2.0" HTTP API / function URL)
     # sqs: queue_arn, queue_url, batch_size, report_batch_item_failures
-    # schedule: expression, input (JSON string or None)
+    # schedule: expression, input (JSON string or None), source ("eventbridge-rule" or "scheduler"),
+    #   timezone (Scheduler only), rule_arn or schedule_arn / schedule_name / group_name
+    # stepfunctions: state_machine_arn, state_machine_name, type (STANDARD/EXPRESS), definition (dict),
+    #   refs (strings in the definition that name this function), tasks ([{path, form, problem}])
     # s3: bucket, events, filter_rules ([{"Name": "prefix", "Value": ...}])
     # sns: topic_arn, filter_policy, filter_policy_scope
     # kinesis/dynamodb: stream_arn, stream_name / table_name, starting_position, batch_size,

@@ -9,8 +9,9 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from ..model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SNS, SQS, UNSUPPORTED, FunctionSpec, Trigger
+from ..model import DYNAMODB, HTTP, KINESIS, S3, SCHEDULE, SFN, SNS, SQS, UNSUPPORTED, FunctionSpec, Trigger
 from ..plan import k8s_name
+from ..stepfunctions import find_tasks
 
 
 def load_from_aws(names: list[str], download_to: Path, region: str | None = None, profile: str | None = None) -> list[FunctionSpec]:
@@ -20,7 +21,8 @@ def load_from_aws(names: list[str], download_to: Path, region: str | None = None
         raise SystemExit("the aws loader needs boto3: pip install 'lambda2eks[aws]'") from e
 
     session = boto3.Session(region_name=region, profile_name=profile)
-    clients = {n: session.client(n) for n in ("lambda", "events", "apigatewayv2", "s3", "sns")}
+    clients: dict[str, Any] = {n: session.client(n) for n in ("lambda", "events", "apigatewayv2", "s3", "sns", "scheduler", "stepfunctions")}
+    clients["_cache"] = {}  # account-wide scans (schedules, state machines) done once for all functions
     return [_load_one(clients, name, download_to) for name in names]
 
 
@@ -67,6 +69,9 @@ def _load_one(clients: dict[str, Any], name: str, download_to: Path) -> Function
         warnings=warnings,
     )
     spec.triggers = _event_source_mappings(lam, name, warnings) + _policy_triggers(clients, name, arn, warnings)
+    # EventBridge Scheduler and Step Functions call the function with an IAM role of their own, so they leave
+    # nothing in its resource policy: they are found by scanning the schedules and state machines.
+    spec.triggers += _scheduler_triggers(clients, arn, warnings) + _sfn_triggers(clients, cfg["FunctionName"], arn, warnings)
     try:
         lam.get_function_url_config(FunctionName=name)
         spec.triggers.append(Trigger(HTTP, {"method": "ANY", "path": None, "event_format": "2.0", "source": "function-url"}))
@@ -269,3 +274,82 @@ def _sns_trigger(sns: Any, topic_arn: str, fn_arn: str, warnings: list[str]) -> 
     except Exception as e:  # noqa: BLE001 - permissions vary
         warnings.append(f"could not read the subscriptions of {topic_arn} ({e.__class__.__name__}); copy any filter policy by hand")
     return Trigger(SNS, details)
+
+
+def _same_function(target_arn: str, fn_arn: str) -> bool:
+    """A target ARN names this function, with or without a version or alias qualifier."""
+    return target_arn == fn_arn or target_arn.startswith(fn_arn + ":")
+
+
+def _scheduler_triggers(clients: dict[str, Any], fn_arn: str, warnings: list[str]) -> list[Trigger]:
+    sched, cache = clients.get("scheduler"), clients.setdefault("_cache", {})
+    if sched is None:
+        return []
+    if "schedules" not in cache:
+        try:
+            cache["schedules"] = [s for page in sched.get_paginator("list_schedules").paginate() for s in page.get("Schedules", [])]
+        except Exception as e:  # noqa: BLE001 - permissions vary
+            cache["schedules"] = []
+            warnings.append(f"could not list EventBridge Scheduler schedules ({e.__class__.__name__}); "
+                            "a schedule that invokes this function would be missed")
+    out = []
+    for summary in cache["schedules"]:
+        if not _same_function((summary.get("Target") or {}).get("Arn", ""), fn_arn):
+            continue
+        name, group = summary["Name"], summary.get("GroupName") or "default"
+        try:
+            s = sched.get_schedule(Name=name, GroupName=group)
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"could not read schedule {group}/{name} ({e.__class__.__name__})")
+            continue
+        target = s.get("Target") or {}
+        if (s.get("FlexibleTimeWindow") or {}).get("Mode") == "FLEXIBLE":
+            warnings.append(f"schedule {group}/{name}: the flexible time window is not reproduced; the CronJob starts on time")
+        if s.get("StartDate") or s.get("EndDate"):
+            warnings.append(f"schedule {group}/{name}: StartDate/EndDate are not reproduced; suspend or delete the CronJob by hand")
+        if (target.get("DeadLetterConfig") or {}).get("Arn"):
+            warnings.append(f"schedule {group}/{name}: the scheduler's dead-letter queue is not reproduced; failed Jobs stay in the cluster")
+        out.append(Trigger(SCHEDULE, {
+            "expression": s["ScheduleExpression"], "timezone": s.get("ScheduleExpressionTimezone"),
+            "input": target.get("Input"), "source": "scheduler", "schedule_arn": s.get("Arn"),
+            "schedule_name": name, "group_name": group, "suspended": s.get("State") == "DISABLED",
+            "detail": f"EventBridge Scheduler schedule {group}/{name}",
+        }))
+    return out
+
+
+def _sfn_triggers(clients: dict[str, Any], name: str, fn_arn: str, warnings: list[str]) -> list[Trigger]:
+    sfn, cache = clients.get("stepfunctions"), clients.setdefault("_cache", {})
+    if sfn is None:
+        return []
+    if "state_machines" not in cache:
+        cache["state_machines"] = []
+        try:
+            arns = [m["stateMachineArn"] for page in sfn.get_paginator("list_state_machines").paginate()
+                    for m in page.get("stateMachines", [])]
+            for arn in arns:
+                try:
+                    cache["state_machines"].append(sfn.describe_state_machine(stateMachineArn=arn))
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"could not read state machine {arn} ({e.__class__.__name__})")
+        except Exception as e:  # noqa: BLE001 - permissions vary
+            warnings.append(f"could not list Step Functions state machines ({e.__class__.__name__}); "
+                            "a state machine that calls this function would be missed")
+    out = []
+    for m in cache["state_machines"]:
+        if name not in (m.get("definition") or ""):
+            continue
+        try:
+            definition = json.loads(m["definition"])
+        except (TypeError, ValueError):
+            continue
+        refs = [fn_arn]
+        tasks = find_tasks(definition, name, refs)
+        if not tasks:
+            continue
+        out.append(Trigger(SFN, {
+            "state_machine_arn": m["stateMachineArn"], "state_machine_name": m.get("name"), "type": m.get("type", "STANDARD"),
+            "definition": definition, "refs": refs, "tasks": tasks,
+            "detail": f"Step Functions state machine {m.get('name')} ({', '.join(t['path'] for t in tasks)})",
+        }))
+    return out

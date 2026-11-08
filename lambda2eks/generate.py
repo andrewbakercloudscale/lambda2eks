@@ -11,9 +11,12 @@ from typing import Any
 
 import yaml
 
-from .model import BRIDGED, DYNAMODB, HTTP, INVOKE, KINESIS, S3, SCHEDULE, SNS, SQS, STREAMS
+from datetime import datetime, timezone
+
+from .model import BRIDGED, DYNAMODB, HTTP, INVOKE, KINESIS, S3, SCHEDULE, SFN, SNS, SQS, STREAMS
 from .plan import Plan, Workload
-from .schedule import ScheduleError, to_k8s_cron
+from .schedule import ScheduleError, at_time, schedule_years, to_k8s_cron
+from .stepfunctions import machine_name, rewrite
 
 HEALTH_PATH = "/_lambda2eks/healthz"
 PORT = 8080
@@ -191,7 +194,7 @@ def _pod_spec(plan: Plan, workload: Workload, mode_env: list[dict[str, str]], re
 # On Lambda the queue and stream pollers run outside the function's sandbox, so its memory setting
 # covers the handler only. Here the shim polls inside the same container: SDK clients, lease
 # bookkeeping and an in-flight batch. A 128 MB stream consumer was OOM-killed without this.
-POLLER_OVERHEAD_MB = {"sqs": 64, "stream": 96}
+POLLER_OVERHEAD_MB = {"sqs": 64, "stream": 96, "activity": 64}
 
 
 def pod_memory_mb(plan: Plan, workload: Workload) -> int:
@@ -200,7 +203,7 @@ def pod_memory_mb(plan: Plan, workload: Workload) -> int:
 
 def workload_mode(w: Workload) -> str:
     return {HTTP: "http", INVOKE: "http", SQS: "sqs", S3: "sqs", SNS: "sqs", SCHEDULE: "schedule",
-            KINESIS: "stream", DYNAMODB: "stream"}[w.kind]
+            KINESIS: "stream", DYNAMODB: "stream", SFN: "activity"}[w.kind]
 
 
 class Target:
@@ -222,6 +225,12 @@ class Target:
 
     def lease_table_arn(self, plan: Plan) -> str:
         return f"arn:aws:dynamodb:{self.region}:{self.account}:table/{self.lease_table(plan)}"
+
+    def activity_name(self, plan: Plan) -> str:
+        return f"l2e-{plan.k8s_name}"
+
+    def activity_arn(self, plan: Plan) -> str:
+        return f"arn:aws:states:{self.region}:{self.account}:activity:{self.activity_name(plan)}"
 
 
 def _deployment(plan: Plan, w: Workload, replicas: int, pod: dict[str, Any]) -> dict[str, Any]:
@@ -394,23 +403,38 @@ def schedule_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
     except ScheduleError as e:
         cron, warns = "0 0 31 2 *", [f"{e}; the CronJob is set to a date that never occurs and suspended until you fix it"]
         d["suspended"] = True
+    tz = d.get("timezone") or "Etc/UTC"
+    once = at_time(d["expression"], tz)
+    if once and once < datetime.now(timezone.utc) and not d.get("suspended"):
+        warns.append(f"{d['expression']} ({tz}) is in the past, so the one-time schedule has already run; the CronJob is suspended")
+        d["suspended"] = True
     plan.spec.warnings.extend(w_ for w_ in warns if w_ not in plan.spec.warnings)
-    mode_env = []
+    scheduler = d.get("source") == "scheduler"
+    mode_env = [{"name": "L2E_SCHEDULE_SOURCE", "value": "scheduler" if scheduler else "eventbridge-rule"}]
     if d.get("input"):
         mode_env.append({"name": "L2E_SCHEDULE_INPUT", "value": d["input"]})
     if d.get("rule_arn"):
         mode_env.append({"name": "L2E_SCHEDULE_RULE_ARN", "value": d["rule_arn"]})
+    if scheduler:
+        arn = d.get("schedule_arn") or (f"arn:aws:scheduler:{t.region}:{t.account}:schedule/{d.get('group_name') or 'default'}/"
+                                        f"{d.get('schedule_name') or 'REPLACE_ME_SCHEDULE'}")
+        mode_env.append({"name": "L2E_SCHEDULE_ARN", "value": arn})
+    years = schedule_years(d["expression"])
+    if years:
+        # Kubernetes cron has no year: the CronJob fires every year in this slot and the shim skips other years.
+        mode_env += [{"name": "L2E_SCHEDULE_YEARS", "value": years}, {"name": "L2E_SCHEDULE_TZ", "value": tz}]
     pod = _pod_spec(plan, w, mode_env, t.region, http=False, restart="Never")
     labels = _labels(plan, w.name)
-    annotations = {"lambda2eks/eventbridge-schedule": d["expression"]}
+    annotations = {"lambda2eks/scheduler-schedule" if scheduler else "lambda2eks/eventbridge-schedule": d["expression"]}
     if d.get("suspended"):
-        annotations["lambda2eks/note"] = "the EventBridge schedule was disabled; keep this suspended"
+        annotations["lambda2eks/note"] = ("the one-time schedule has passed or was disabled; keep this suspended" if once else
+                                          "the EventBridge schedule was disabled; keep this suspended")
     return [{
         "apiVersion": "batch/v1", "kind": "CronJob",
         "metadata": {"name": w.name, "labels": labels, "annotations": annotations},
         "spec": {
             # Suspended until the cut-over disables the EventBridge rule, so the job never runs twice.
-            "schedule": cron, "timeZone": "Etc/UTC", "suspend": bool(d.get("suspended")) or not t.live,
+            "schedule": cron, "timeZone": tz, "suspend": bool(d.get("suspended")) or not t.live,
             "concurrencyPolicy": plan.schedule_concurrency_policy, "startingDeadlineSeconds": 300,
             "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 3,
             "jobTemplate": {"spec": {
@@ -421,6 +445,25 @@ def schedule_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
             }},
         },
     }]
+
+
+def sfn_docs(plan: Plan, w: Workload, t: Target) -> list[dict[str, Any]]:
+    mode_env = [{"name": "L2E_SFN_ACTIVITY_ARN", "value": t.activity_arn(plan)},
+                {"name": "L2E_SFN_HEARTBEAT_S", "value": "20"}]
+    # The workers can run before the cut-over: nothing reaches the activity until the state machine is switched to it.
+    grace = plan.spec.timeout_s + 70  # a long poll (up to 60 s) can hand over one more task after SIGTERM
+    return [_deployment(plan, w, plan.sfn_replicas, _pod_spec(plan, w, mode_env, t.region, http=False, grace=grace))]
+
+
+def sfn_rewrites(plan: Plan, t: Target) -> dict[str, tuple[dict[str, Any], list[str], list[str], dict[str, Any]]]:
+    """state machine name -> (definition calling the activity, rewritten states, notes, trigger details)."""
+    out = {}
+    for w in (w for w in plan.workloads if w.kind == SFN):
+        for d in w.trigger.details["machines"]:
+            name = machine_name(d.get("state_machine_arn") or d.get("state_machine_name") or "state-machine")
+            new, done, notes = rewrite(d["definition"], plan.spec.name, d.get("refs") or [], t.activity_arn(plan), plan.spec.timeout_s)
+            out[name] = (new, done, notes, d)
+    return out
 
 
 def manifests(plan: Plan, namespace: str, region: str, iam_mode: str, live: bool = False,
@@ -451,6 +494,8 @@ def manifests(plan: Plan, namespace: str, region: str, iam_mode: str, live: bool
             files[f"{w.name}.yaml"] = stream_docs(plan, w, t)
         elif w.kind == SCHEDULE:
             files[f"{w.name}.yaml"] = schedule_docs(plan, w, t)
+        elif w.kind == SFN:
+            files[f"{w.name}.yaml"] = sfn_docs(plan, w, t)
     return files
 
 
@@ -481,10 +526,11 @@ def _cfn_id(name: str) -> str:
 
 
 def infra_stack(plan: Plan, t: Target) -> dict[str, Any] | None:
-    """CloudFormation for the bridge queues (S3/SNS -> SQS) and the stream lease table, or None if neither is needed."""
+    """CloudFormation for the bridge queues (S3/SNS -> SQS), the stream lease table and the Step Functions activity, or None."""
     bridged = [w for w in plan.workloads if w.kind in BRIDGED]
     streams = [w for w in plan.workloads if w.kind in STREAMS]
-    if not bridged and not streams:
+    sfn = any(w.kind == SFN for w in plan.workloads)
+    if not bridged and not streams and not sfn:
         return None
     resources: dict[str, Any] = {}
     outputs: dict[str, Any] = {}
@@ -533,8 +579,11 @@ def infra_stack(plan: Plan, t: Target) -> dict[str, Any] | None:
             "AttributeDefinitions": [{"AttributeName": "shard", "AttributeType": "S"}],
             "KeySchema": [{"AttributeName": "shard", "KeyType": "HASH"}]}}
         outputs["LeaseTable"] = {"Value": {"Ref": "LeaseTable"}}
+    if sfn:
+        resources["Activity"] = {"Type": "AWS::StepFunctions::Activity", "Properties": {"Name": t.activity_name(plan)}}
+        outputs["ActivityArn"] = {"Value": {"Ref": "Activity"}}
     stack: dict[str, Any] = {"AWSTemplateFormatVersion": "2010-09-09",
-                             "Description": f"lambda2eks resources for {plan.spec.name}: S3/SNS bridge queues and stream leases"}
+                             "Description": f"lambda2eks resources for {plan.spec.name}: bridge queues, stream leases, Step Functions activity"}
     if params:
         stack["Parameters"] = params
     if conditions:
@@ -551,6 +600,9 @@ def worker_policy(plan: Plan, t: Target) -> dict[str, Any] | None:
     if queues:
         statements.append({"Sid": "BridgeQueues", "Effect": "Allow", "Resource": queues, "Action": [
             "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"]})
+    if any(w.kind == SFN for w in plan.workloads):
+        statements.append({"Sid": "StepFunctionsActivity", "Effect": "Allow", "Resource": t.activity_arn(plan), "Action": [
+            "states:GetActivityTask", "states:SendTaskSuccess", "states:SendTaskFailure", "states:SendTaskHeartbeat"]})
     streams = [w for w in plan.workloads if w.kind in STREAMS]
     if streams:
         statements.append({"Sid": "StreamLeases", "Effect": "Allow", "Resource": t.lease_table_arn(plan), "Action": [
@@ -615,7 +667,12 @@ def report(plan: Plan, t: Target, files: dict[str, list[dict[str, Any]]], patch_
                SNS: lambda: f"SNS topic {w.trigger.details.get('topic_arn')} via bridge queue {w.bridge_queue}",
                KINESIS: lambda: f"Kinesis stream {w.trigger.details.get('stream_name') or w.trigger.details.get('stream_arn')}",
                DYNAMODB: lambda: f"DynamoDB stream of table {w.trigger.details.get('table_name')}",
-               SCHEDULE: lambda: w.trigger.details["expression"],
+               SCHEDULE: lambda: (" ".join(x for x in ("EventBridge Scheduler", w.trigger.details.get("schedule_name"), "") if x is not None)
+                                  if w.trigger.details.get("source") == "scheduler" else "") + w.trigger.details["expression"]
+                                 + (f" ({w.trigger.details['timezone']})" if w.trigger.details.get("timezone") else ""),
+               SFN: lambda: "Step Functions " + "; ".join(
+                   f"{m.get('state_machine_name')}: {', '.join(x['path'] for x in m['tasks'] if not x['problem'])}"
+                   for m in w.trigger.details["machines"]) + f" via activity {t.activity_name(plan)}",
                INVOKE: lambda: "direct Invoke API calls"}[w.kind]()
         k8s = ", ".join(d["kind"] for d in files.get(f"{w.name}.yaml", []))
         out.append(f"| `{w.name}` | {_md_cell(src)} | {k8s} |")
@@ -627,6 +684,7 @@ def report(plan: Plan, t: Target, files: dict[str, list[dict[str, Any]]], patch_
         "http_min_replicas": kinds & {HTTP, INVOKE}, "http_max_replicas": kinds & {HTTP, INVOKE},
         "ingress_scheme": kinds & {HTTP}, "sqs_max_replicas": kinds & {SQS, *BRIDGED},
         "stream_max_replicas": kinds & set(STREAMS), "schedule_concurrency_policy": kinds & {SCHEDULE},
+        "sfn_replicas": kinds & {SFN},
     }
     for d in plan.decisions.values():
         if d.setting in relevant and not relevant[d.setting]:
@@ -668,9 +726,14 @@ def report(plan: Plan, t: Target, files: dict[str, list[dict[str, Any]]], patch_
                 + ", ".join(x for x in [
                     "a bridge SQS queue (with a DLQ after 3 tries, like Lambda's async retries) for each S3/SNS trigger" if kinds & set(BRIDGED) else "",
                     f"the lease table `{t.lease_table(plan)}` where stream workers share out shards and keep checkpoints" if kinds & set(STREAMS) else "",
+                    f"the Step Functions activity `{t.activity_name(plan)}` that the rewritten Task states call" if SFN in kinds else "",
                 ] if x) + ". Deploying it changes nothing for the Lambda"
                 + ("; SNS subscriptions stay off until the cut-over." if SNS in kinds else "."), "",
                 *(["```bash", f"aws cloudformation deploy --stack-name lambda2eks-{plan.k8s_name} --template-file infra/resources.yaml", "```", ""])]
+        if extra.get("sfn"):
+            out += ["The state machines switch to the activity at the cut-over, from "
+                    + ", ".join(f"`cutover/sfn-{n}.json`" for n in extra["sfn"]) + ". Each is the definition read at generation "
+                    "time with only the function's Task states changed.", ""]
         if extra.get("s3"):
             out += ["The S3 notifications move to the queues at the cut-over, from "
                     + ", ".join(f"`infra/s3-{b}-queue-config.json`" for b in extra["s3"]) + ".", ""]
@@ -688,7 +751,7 @@ def report(plan: Plan, t: Target, files: dict[str, list[dict[str, Any]]], patch_
     out += ["```", ""]
     if extra.get("worker_policy"):
         out += ["`iam/worker-policy.json` adds what the workers need beyond the Lambda's role: the bridge queues, "
-                "the lease table and the stream reads that Lambda did for the function.", ""]
+                "the lease table, the stream reads and the activity polling that Lambda and Step Functions did for the function.", ""]
     if plan.iam_actions:
         out += ["The AI review found the code calling these actions. Compare them with the role's policies for least privilege:", "",
                 ", ".join(f"`{a}`" for a in plan.iam_actions), ""]
@@ -721,9 +784,14 @@ def report(plan: Plan, t: Target, files: dict[str, list[dict[str, Any]]], patch_
     out += ["## Behaviour differences to know", "",
             f"- One pod runs {plan.concurrency} invocation(s) at a time." + (
                 " Lambda scaled per request; here the HPA scales on CPU, which lags behind sudden bursts." if kinds & {HTTP, INVOKE} else ""),
-            "- A timed-out invocation gets a 504 (HTTP) or a failed batch (SQS, streams), but the handler code keeps running until it returns.",
+            "- A timed-out invocation gets a 504 (HTTP), a failed batch (SQS, streams) or a Sandbox.Timedout task failure (Step Functions), but the handler code keeps running until it returns.",
             *(["- S3 and SNS events arrive through an SQS queue: one event per invocation as before, retried on failure, "
                "then moved to the DLQ after 3 tries. Delivery order is not guaranteed, as on Lambda."] if kinds & set(BRIDGED) else []),
+            *(["- Step Functions tasks wait at the activity until a worker is free. Throughput is "
+               f"{plan.sfn_replicas} worker(s) x {plan.concurrency} task(s) at a time, with no autoscaling (no metric shows the backlog); "
+               "raise `sfn_replicas` for bursts. A worker that dies mid-task leaves the state to its TimeoutSeconds, then its Retry. "
+               "Express workflows cannot call activities, and executions started before the switch keep calling the Lambda."]
+              if SFN in kinds else []),
             *(["- Stream records keep their order per shard, as with Lambda (ParallelizationFactor 1). A replica that dies "
                "mid-batch leaves the batch to be processed again by the next owner of the shard, so handlers must be idempotent."]
               if kinds & set(STREAMS) else []),
@@ -768,6 +836,9 @@ def write_plan(plan: Plan, out: Path, namespace: str, region: str | None, iam_mo
         (out / "iam").mkdir(exist_ok=True)
         (out / "iam" / "trust-policy.json").write_text(json.dumps(trust_policy(plan, namespace, iam_mode), indent=2) + "\n")
         extra["infra"], extra["worker_policy"], extra["s3"] = infra_stack(plan, t), worker_policy(plan, t), s3_queue_configs(plan, t)
+        extra["sfn"] = sfn_rewrites(plan, t)
+        for _name, (_new, _done, notes, _d) in extra["sfn"].items():
+            plan.spec.warnings.extend(n for n in notes if n not in plan.spec.warnings)
         if extra["worker_policy"]:
             (out / "iam" / "worker-policy.json").write_text(json.dumps(extra["worker_policy"], indent=2) + "\n")
         elif (out / "iam" / "worker-policy.json").exists():
@@ -779,6 +850,10 @@ def write_plan(plan: Plan, out: Path, namespace: str, region: str | None, iam_mo
                 (out / "infra" / f"s3-{bucket}-queue-config.json").write_text(json.dumps(configs, indent=2) + "\n")
         cut = out / "cutover"
         cut.mkdir(exist_ok=True)
+        for stale in cut.glob("sfn-*.json"):
+            stale.unlink()
+        for name, (new, _done, _notes, _d) in extra["sfn"].items():
+            (cut / f"sfn-{name}.json").write_text(json.dumps(new, indent=2) + "\n")
         (cut / "CUTOVER.md").write_text(cutover.runbook(plan, t, bool(extra["infra"]), bool(extra["worker_policy"])))
         http = [w for w in plan.workloads if w.kind == HTTP]
         script = cut / "route53-weights.sh"

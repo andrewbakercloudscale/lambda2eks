@@ -24,7 +24,7 @@ from typing import Any
 
 import truststore
 
-from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SQS, STREAMS
+from .model import BRIDGED, HTTP, INVOKE, SCHEDULE, SFN, SQS, STREAMS
 from .plan import MAX_REPLICAS_CAP, SECRET_KEY, Plan
 
 DEFAULT_MODEL = "claude-opus-5-5"
@@ -42,6 +42,7 @@ MAX_TOTAL_CHARS = 1_500_000
 SETTING_KINDS: dict[str, tuple[str, ...]] = {
     "http_min_replicas": (HTTP, INVOKE), "http_max_replicas": (HTTP, INVOKE), "ingress_scheme": (HTTP,),
     "sqs_max_replicas": (SQS, *BRIDGED), "stream_max_replicas": STREAMS, "schedule_concurrency_policy": (SCHEDULE,),
+    "sfn_replicas": (SFN,),
 }
 
 # setting name -> (JSON type, description shown to the model)
@@ -55,6 +56,7 @@ SETTINGS: dict[str, tuple[str, str]] = {
     "stream_max_replicas": ("integer", "Maximum replicas for Kinesis/DynamoDB stream consumers (1-200). KEDA runs about one pod per shard up to this."),
     "ingress_scheme": ("string", "ALB scheme: 'internal' or 'internet-facing'."),
     "schedule_concurrency_policy": ("string", "CronJob concurrencyPolicy: 'Allow', 'Forbid' or 'Replace'."),
+    "sfn_replicas": ("integer", "Step Functions activity workers (1-200). Fixed count, no autoscaling: tasks wait at the activity for a free worker, so size for the peak number of concurrent executions reaching this state divided by concurrency."),
 }
 
 SYSTEM_PROMPT = """You are a senior platform engineer reviewing one AWS Lambda function that is being moved to Amazon EKS by the lambda2eks tool. You get the function's configuration, the plan the tool's rules produced, and the function's source code. Your answer sets the plan's final values and tells the team what must change before the function runs well on Kubernetes.
@@ -65,7 +67,8 @@ How lambda2eks runs a function on EKS, so you know what is already handled:
 - SQS triggers become a worker Deployment that long-polls the queue, passes Lambda-shaped batches to the handler, deletes on success, honours ReportBatchItemFailures, and leaves failures for the queue's redrive policy. KEDA scales it on queue depth, down to zero.
 - S3 notifications and SNS subscriptions are moved to a new SQS "bridge" queue (with a DLQ after 3 tries). A worker reads it, rebuilds the exact event Lambda would have received (S3 Records, or the SNS Records envelope), and invokes the handler once per event. Delivery is at least once, so duplicates are possible, as on Lambda. The SNS subscription's filter policy and the S3 event types and prefix/suffix filters are copied to the new subscription and notification, so the handler sees the same events as before.
 - Kinesis and DynamoDB Streams triggers become a consumer Deployment. Replicas share the shards through leases in a DynamoDB table, keep a checkpoint per shard, finish parent shards before children, and pass Lambda-shaped batches. BatchSize, MaximumRetryAttempts, BisectBatchOnFunctionError and ReportBatchItemFailures behave as on Lambda. ParallelizationFactor > 1, tumbling windows, FilterCriteria and on-failure destinations are NOT reproduced. A record can be processed twice after a crash or during the cut-over.
-- EventBridge schedules become a CronJob (UTC) that sends the scheduled event or the rule's constant input. backoffLimit 2 matches Lambda's async retries.
+- EventBridge rule schedules and EventBridge Scheduler schedules become a CronJob (rules in UTC; Scheduler in the schedule's time zone, and one-time at() schedules run once) that sends the scheduled event or the target's constant input. backoffLimit 2 matches Lambda's async retries. Scheduler flexible time windows, start/end dates and the scheduler's DLQ are NOT reproduced.
+- Step Functions Task states that call the function (directly or through lambda:invoke) are rewritten to call a Step Functions activity, and a fixed-size worker Deployment polls it, runs the handler with the same input, and reports the result or the error (error name = exception type, so Retry/Catch still match). The lambda:invoke output wrapper ({Payload, StatusCode}) is kept with a ResultSelector. Express workflows, .waitForTaskToken and JSONata states are NOT converted and stay on Lambda. Context fields the handler may read differ: there is no client_context or identity, and invocations from Step Functions are no longer visible in Lambda metrics.
 - Functions with no trigger get a Deployment and Service exposing the Lambda Invoke API path (POST /2015-03-31/functions/function/invocations), so callers can switch endpoints.
 - The context object provides function_name, memory_limit_in_mb, aws_request_id, invoked_function_arn, log_group_name, log_stream_name and get_remaining_time_in_millis (Node: the camelCase equivalents). The invocation timeout is enforced by answering 504 / failing the batch, but the handler keeps running in the background.
 - AWS_LAMBDA_FUNCTION_NAME, AWS_LAMBDA_FUNCTION_MEMORY_SIZE, AWS_LAMBDA_FUNCTION_VERSION, AWS_REGION and AWS_DEFAULT_REGION are set. /tmp is an emptyDir sized like the function's ephemeral storage, and the root filesystem is read-only.
@@ -76,7 +79,7 @@ What to decide:
 1. Concurrency. Lambda never runs two invocations in one process, and handlers are often written on that assumption. Read the code. It is unsafe to raise concurrency if module-level mutable state is changed per request, /tmp paths are shared between invocations, non-thread-safe clients are reused, or (for Python) the work is CPU-bound, so threads gain nothing. Set concurrency_safe from what you see, and raise concurrency only when it is safe and the work is I/O-bound.
 2. Resources. Lambda gives CPU in proportion to memory. Keep the memory unless the code clearly needs more or much less, and size the CPU for what the code does, e.g. image processing versus a thin API proxy.
 3. Scaling bounds and the ingress scheme. Choose internet-facing only if the trigger was a public API with no sign the API was private. Without an authorizer or auth in code, say in a finding that the ALB has no authentication.
-4. Overlapping scheduled runs. Use Forbid when overlapping runs would double-process or corrupt data.
+4. Overlapping scheduled runs. Use Forbid when overlapping runs would double-process or corrupt data. For Step Functions workers, size sfn_replicas for the expected concurrent executions.
 5. Which environment variables hold secrets. Values were redacted before they reached you when they looked sensitive. Judge by name, redaction and use in code.
 6. IAM actions the handler code itself calls, as service:Action strings, for a least-privilege review of the role. Leave out what the worker does for the handler (reading queues and streams, the lease table): lambda2eks grants that separately.
 7. Findings: anything that breaks or behaves differently on EKS. Examples: reliance on Lambda-only features (layers, extensions, Powertools metrics through EMF without a log shipper, X-Ray daemon, Lambda destinations, context.callbackWaitsForEmptyEventLoop, invoking other Lambdas that are being migrated too), heavy cold-start work, writing outside /tmp, hard-coded Lambda paths, timeouts longer than load balancer limits, SQS, S3, SNS or stream handlers that are not idempotent (duplicates happen during the cut-over), code that relies on FilterCriteria having removed records, and missing dependencies. Give a file and line when you can. Severity: blocker = will not work until fixed; high = works but wrong or unsafe; medium = should fix; low = worth knowing.
@@ -205,7 +208,8 @@ def build_user_message(plan: Plan, files: list[tuple[str, str]], omitted: list[s
         "reserved_concurrency": spec.reserved_concurrency, "dead_letter_target": spec.dead_letter_target,
         "container_image": spec.image_uri,
         "environment": {k: redact_env_value(k, v) for k, v in sorted(spec.environment.items())},
-        "triggers": [{"kind": t.kind, **t.details} for t in spec.triggers],
+        # A state machine definition is long and the task list already says which states call the function.
+        "triggers": [{"kind": t.kind, **{k: v for k, v in t.details.items() if k != "definition"}} for t in spec.triggers],
         "loader_warnings": spec.warnings,
     }
     rule_plan = {
@@ -399,7 +403,7 @@ def check_result(result: Any) -> list[str]:
 _BOUNDS = {
     "concurrency": (1, 64), "cpu_millicores": (50, 16000), "memory_mb": (64, 32768),
     "http_min_replicas": (1, MAX_REPLICAS_CAP), "http_max_replicas": (1, MAX_REPLICAS_CAP),
-    "sqs_max_replicas": (1, MAX_REPLICAS_CAP), "stream_max_replicas": (1, MAX_REPLICAS_CAP),
+    "sqs_max_replicas": (1, MAX_REPLICAS_CAP), "stream_max_replicas": (1, MAX_REPLICAS_CAP), "sfn_replicas": (1, MAX_REPLICAS_CAP),
 }
 _ENUMS = {"ingress_scheme": {"internal", "internet-facing"}, "schedule_concurrency_policy": {"Allow", "Forbid", "Replace"}}
 

@@ -34,13 +34,15 @@ Guard rails:
 |---|---|
 | API Gateway REST (payload 1.0), HTTP API / function URL (2.0) | Deployment + Service + ALB Ingress + HPA + PDB |
 | SQS event source | Worker Deployment + KEDA ScaledObject (scales to zero) |
-| EventBridge schedule | CronJob (UTC, 2 retries like async Lambda) |
+| EventBridge rule schedule | CronJob (UTC, 2 retries like async Lambda) |
+| EventBridge Scheduler schedule | CronJob in the schedule's time zone. `at()` one-time schedules run once (the shim skips other years); a past one is created suspended. Input context attributes (`<aws.scheduler.scheduled-time>` etc.) are filled in. Flexible windows, start/end dates and the scheduler's DLQ are reported, not reproduced. |
+| Step Functions Task state | The state is rewritten to call a Step Functions **activity**; a worker Deployment polls it, runs the handler and reports the result or the error (error name = exception type, so Retry/Catch still match). `lambda:invoke`'s `{Payload, StatusCode}` wrapper is kept with a ResultSelector. No ingress needed. Express workflows, `.waitForTaskToken` and JSONata states are reported and stay on Lambda. |
 | No trigger | Deployment + Service exposing the Lambda Invoke API path |
 | S3 notification, SNS subscription | New SQS **bridge** queue (+ DLQ) and a KEDA worker that rebuilds the exact S3/SNS event. Filter policy and prefix/suffix rules are copied. |
 | Kinesis, DynamoDB Streams | Consumer Deployment + KEDA. Replicas share shards via leases in a DynamoDB table, checkpoint per shard, parent before child. BatchSize, MaximumRetryAttempts, BisectBatchOnFunctionError, ReportBatchItemFailures as on Lambda. |
 | Event-pattern rules, other sources | Reported, with AI advice |
 
-The image is the AWS Lambda base image for the runtime (Python 3.x, Node.js 18+). A shim (`lambda2eks/shims/`) takes the place of the Lambda runtime and calls your **unchanged** handler. It builds API Gateway events (with path parameters), converts responses, handles SQS batches including `ReportBatchItemFailures`, unwraps bridged S3/SNS events, runs the stream consumer, provides the `context` object, and enforces the timeout.
+The image is the AWS Lambda base image for the runtime (Python 3.x, Node.js 18+). A shim (`lambda2eks/shims/`) takes the place of the Lambda runtime and calls your **unchanged** handler. It builds API Gateway events (with path parameters), converts responses, handles SQS batches including `ReportBatchItemFailures`, unwraps bridged S3/SNS events, runs the stream consumer and the Step Functions activity worker, provides the `context` object, and enforces the timeout.
 
 ## Usage
 
@@ -74,9 +76,10 @@ Dockerfile, build.sh, src/, lambda2eks-shim.*   build context
 k8s/  (kustomization.yaml)                      kubectl apply -k k8s/
 helm/                                           the same objects as a chart (--format helm|both)
 iam/trust-policy.json                           keeps the Lambda trust and adds EKS
-iam/worker-policy.json                          bridge queues, lease table, stream reads
-infra/resources.yaml                            CloudFormation: bridge queues + DLQs, SNS subscription, lease table
+iam/worker-policy.json                          bridge queues, lease table, stream reads, activity polling
+infra/resources.yaml                            CloudFormation: bridge queues + DLQs, SNS subscription, lease table, activity
 cutover/CUTOVER.md, cutover/route53-weights.sh  per-trigger switch-over with rollback
+cutover/sfn-<state machine>.json                the definition with the function's Task states calling the activity
 ai/review.json, ai/patches/*.diff               the raw review and suggested fixes
 MIGRATION.md                                    decisions, findings, steps, placeholders to fill
 ```
@@ -92,13 +95,14 @@ Applying the output moves no events: queue and stream workers start paused (KEDA
 - S3: switch the bucket notification to the bridge queue.
 - SNS: subscribe the bridge queue, then remove the Lambda subscription (short overlap, so expect duplicates).
 - Streams: start the consumer at `LATEST` next to the Lambda, wait for its IteratorAge to settle, then disable the mapping.
-- Schedules: disable the rule, unsuspend the CronJob.
+- Schedules: disable the rule (or the Scheduler schedule), unsuspend the CronJob.
+- Step Functions: `update-state-machine` with `cutover/sfn-*.json` (the old definition is saved first for rollback). Executions already running finish on the Lambda.
 
 `--live` skips the pausing for greenfield installs.
 
 ## Not migrated
 
-Layers, extensions, VPC config, FilterCriteria on event source mappings, ParallelizationFactor > 1, tumbling windows, provisioned concurrency, destinations, async DLQs, and API Gateway authorizers, throttling and CORS. The report lists those that apply to each function.
+Layers, extensions, VPC config, FilterCriteria on event source mappings, ParallelizationFactor > 1, tumbling windows, provisioned concurrency, destinations, async DLQs, Scheduler flexible windows and DLQs, Step Functions Express workflows and `.waitForTaskToken` states, and API Gateway authorizers, throttling and CORS. The report lists those that apply to each function.
 
 ## End-to-end on a laptop
 
